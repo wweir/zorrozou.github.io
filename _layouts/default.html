@@ -37,6 +37,11 @@
           <li><a href="{{ site.github.repository_url }}">View On <strong>GitHub</strong></a></li>
         </ul>
         {% endif %}
+
+        <nav id="toc" class="toc">
+          <h3 class="toc-title">目录</h3>
+          <ul id="toc-list"></ul>
+        </nav>
       </header>
       <section>
 
@@ -51,6 +56,62 @@
       </footer>
     </div>
     <script src="{{ "/assets/js/scale.fix.js" | relative_url }}"></script>
+    <script>
+    (function() {
+      var section = document.querySelector('section');
+      var tocList = document.getElementById('toc-list');
+      var tocNav = document.getElementById('toc');
+      if (!section || !tocList || !tocNav) return;
+
+      var headings = section.querySelectorAll('h2, h3');
+      if (headings.length === 0) {
+        tocNav.style.display = 'none';
+        return;
+      }
+
+      headings.forEach(function(heading, index) {
+        if (!heading.id) {
+          heading.id = 'heading-' + index;
+        }
+        var li = document.createElement('li');
+        li.className = 'toc-' + heading.tagName.toLowerCase();
+        var a = document.createElement('a');
+        a.href = '#' + heading.id;
+        a.textContent = heading.textContent;
+        a.title = heading.textContent;
+        li.appendChild(a);
+        tocList.appendChild(li);
+      });
+
+      // Highlight current section on scroll
+      var tocLinks = tocList.querySelectorAll('a');
+      var headingArr = Array.prototype.slice.call(headings);
+      window.addEventListener('scroll', function() {
+        var scrollPos = window.scrollY || document.documentElement.scrollTop;
+        var current = null;
+        for (var i = 0; i < headingArr.length; i++) {
+          if (headingArr[i].offsetTop <= scrollPos + 80) {
+            current = headingArr[i];
+          }
+        }
+        tocLinks.forEach(function(link) {
+          link.classList.remove('toc-active');
+        });
+        if (current && current.id) {
+          var activeLink = tocList.querySelector('a[href="#' + current.id + '"]');
+          if (activeLink) {
+            activeLink.classList.add('toc-active');
+            // Scroll the TOC to keep active item visible
+            var tocContainer = tocNav;
+            var linkTop = activeLink.offsetTop - tocContainer.offsetTop;
+            if (linkTop < tocContainer.scrollTop || linkTop > tocContainer.scrollTop + tocContainer.clientHeight - 30) {
+              tocContainer.scrollTop = linkTop - 60;
+            }
+          }
+        }
+      });
+    })();
+    </script>
     {% if site.google_analytics %}
     <script>
       (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){

@@ -712,7 +712,7 @@ Group 3: (Blocks 98304-131071) [INODE_UNINIT, ITABLE_ZEROED]
 
 超级块（superblock）：
 
-就是我们在dumpefs现实中看到的前些行块组信息以外的内容。记录了整个文件系统的块大小、inode大小、块、inode个数、日志块等关键属性信息。
+就是我们在dumpefs显示中看到的前些行块组信息以外的内容。记录了整个文件系统的块大小、inode大小、块、inode个数、日志块等关键属性信息。
 
 组描述符（Group descriptors）：
 
