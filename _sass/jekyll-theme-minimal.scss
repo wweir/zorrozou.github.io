@@ -4,14 +4,20 @@
 body {
   background-color: #fff;
   padding:50px;
-  font: 14px/1.5 "Noto Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
-  color:#727272;
+  font: 14px/1.8 "Inter", "Noto Serif SC", "Noto Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  color:#555;
   font-weight:400;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 h1, h2, h3, h4, h5, h6 {
-  color:#222;
+  color:#1a1a1a;
   margin:0 0 20px;
+  font-family: "Inter", "Noto Serif SC", "Noto Sans", sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
 p, ul, ol, table, pre, dl {
@@ -27,21 +33,21 @@ h1 {
 }
 
 h2 {
-  color:#393939;
+  color:#2a2a2a;
 }
 
 h3, h4, h5, h6 {
-  color:#494949;
+  color:#3a3a3a;
 }
 
 a {
   color:#267CB9;
   text-decoration:none;
+  transition: color 0.2s ease;
 }
 
 a:hover, a:focus {
   color:#069;
-  font-weight: bold;
 }
 
 a small {
@@ -61,15 +67,18 @@ a:hover small {
 }
 
 blockquote {
-  border-left:1px solid #e5e5e5;
+  border-left:3px solid #267CB9;
   margin:0;
   padding:0 0 0 20px;
   font-style:italic;
+  color:#666;
+  font-family: "Noto Serif SC", "Inter", Georgia, serif;
 }
 
 code, pre {
-  font-family:Monaco, Bitstream Vera Sans Mono, Lucida Console, Terminal, Consolas, Liberation Mono, DejaVu Sans Mono, Courier New, monospace;
+  font-family: "JetBrains Mono", Monaco, "Fira Code", Consolas, "Liberation Mono", "DejaVu Sans Mono", "Courier New", monospace;
   color:#333;
+  font-size: 13px;
 }
 
 pre {
@@ -107,10 +116,26 @@ img {
 }
 
 header {
-  width:180px;
+  width:200px;
   float:left;
   position:fixed;
   -webkit-font-smoothing:subpixel-antialiased;
+}
+
+header h1 {
+  white-space: nowrap;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+header h1 a {
+  color: #1a1a1a;
+  transition: color 0.2s ease;
+}
+
+header h1 a:hover {
+  color: #267CB9;
 }
 
 header img {
@@ -138,7 +163,9 @@ header img {
 
 .toc-title {
   font-size: 14px;
-  color: #444;
+  font-family: "Inter", "Noto Serif SC", sans-serif;
+  font-weight: 600;
+  color: #333;
   margin-bottom: 8px !important;
 }
 
@@ -156,8 +183,9 @@ header img {
 
 #toc-list li a {
   display: block;
-  font-size: 13px;
-  color: #727272;
+  font-size: 12px;
+  font-family: "Inter", "Noto Serif SC", sans-serif;
+  color: #666;
   padding: 3px 0;
   text-decoration: none;
   overflow: hidden;
@@ -192,7 +220,7 @@ ul.downloads {
   background: #f4f4f4;
   border-radius:5px;
   border:1px solid #e0e0e0;
-  width:180px;
+  width:200px;
 }
 
 .downloads li {
@@ -246,7 +274,7 @@ strong {
 }
 
 section {
-  width:860px;
+  width:840px;
   float:right;
   padding-bottom:50px;
 }
@@ -263,7 +291,7 @@ hr {
 }
 
 footer {
-  width:180px;
+  width:200px;
   float:left;
   position:fixed;
   bottom:50px;
