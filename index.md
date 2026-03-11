@@ -34,7 +34,7 @@ layout: default
 * [Linux的内存回收和交换](docs/books/linuxde_nei_cun_hui_shou_he_jiao_huan.md)
 * [Linux的IO调度](docs/books/linuxde-io-diao-du.md)
 * [Linux软RAID与LVM性能优化指南——从内核源码看实现与调优](docs/linux-softraid-lvm-performance.md)
-* [NFS存储性能优化非官方指北](docs/books/nfs-storage-performance-optimization.md)
+* [Ceph存储性能优化实战](docs/storage/ceph_storage_performance_tuning.md)
 
 ## Shell编程
 
@@ -51,6 +51,7 @@ layout: default
 
 * [ext4数据恢复实战及文件系统结构详解](docs/ext4/ext4.md)
 * [xfs文件系统结构详解](docs/xfs/XFS文件系统结构.md)
+* [NFS存储性能优化非官方指北](docs/books/nfs-storage-performance-optimization.md)
 
 ## TCP协议
 
@@ -58,4 +59,3 @@ layout: default
 * [Linux的TCP实现之：三次握手](docs/tcp/handshake/tcp_three_way_handshake.md)
 * [Linux的TCP实现之：四次挥手](docs/tcp/wavehand/TCP_Wavehand.md)
 * [Linux的TCP实现之：慢启动](docs/tcp/tcp_slowstart.md)
-
