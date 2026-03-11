@@ -35,15 +35,27 @@
 
 ### CPU 收包性能瓶颈分析
 
-无论在压测写还是读的时候，从收包方的负载来看，中断的消耗会把单核打满。测试机型有 48 个网卡 IRQ 队列，所有对应核心的 CPU 消耗都达到 100%，明显存在性能瓶颈。
+![CVM CPU 负载：IRQ 中断把单核打满](images/ceph/image1.png)
+
+无论在压测写还是读的时候，从收包方的负载来看，中断的消耗会把单核打满。测试机型有 48 个网卡 IRQ 队列，所有对应核心的 CPU 消耗都达到 100%，明显存在性能瓶颈。对应裸金属服务器的 CPU 负载为：
+
+![裸金属服务器 CPU 负载](images/ceph/image2.png)
 
 除了 CVM 和裸金属的机型差异外，CVM 环境用的是客户自定义的 Ubuntu 24.04 操作系统，裸金属用的是定制 Linux + 4.x 内核。
 
-经 perf 分析发现，CVM 的主要消耗在内存清零操作上，而裸金属没有这个现象。
+经 perf 分析发现：
+
+![CVM perf 分析：clear_page_erms 占比 32.59%](images/ceph/image3.png)
+
+CVM 的主要消耗在内存清零操作上，而裸金属没有这个现象：
+
+![裸金属 perf 分析：无 clear_page 问题](images/ceph/image4.png)
 
 ### 优化点：init_on_alloc=0
 
 经确认发现，客户的 Ubuntu 镜像的内核 `CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y` 是开着的。在 CVM 的测试环境上，这会导致每次申请内存时都对内存清零，使 IRQ 中断占用 CPU 特别高。这可以通过内核参数 `init_on_alloc=0` 来关闭。关闭后 CVM 环境的收包性能提升明显。而裸金属用的内核 `CONFIG_INIT_ON_ALLOC_DEFAULT_ON is not set`，这个选项本身就是关闭的。
+
+![关闭 init_on_alloc 后 CVM 负载明显改善](images/ceph/image5.png)
 
 ### 优化点：关闭网卡大页分配
 
@@ -55,17 +67,27 @@ echo 1 > /proc/sys/net/core/high_order_alloc_disable
 
 关闭网卡大页分配。在带宽较高时，这会减少内核 buddy allocator 的 spinlock 竞争。实际测试中 CPU 消耗略有下降，但 perf 热点变化不大。
 
+![关闭网卡大页分配后 perf 热点](images/ceph/image6.png)
+
 ### 优化点：收包校验 Offload
 
-在 perf 分析中，我们还发现 `csum_partial` 占用比率较高。
+在 perf 分析中，我们还发现 `csum_partial` 占用比率较高：
+
+![perf 中 csum_partial 占用较高](images/ceph/image7.png)
 
 `ethtool -k` 查看网卡对应的 rx csum、gso 等选项都是开启的。经确认发现，底层智能网卡之前有一个 bug，会造成 csum 本来是错的，但底层未进行计算就认为是对的，传递给子机标记为已校验，然后出现静默错误。之前研发没有修复这个问题，而是把这个标记功能关闭了，所以需要在宿主机上将 csum 选项打开。
 
-修复后 csum 相关处理占比已经消失。
+修复后 csum 相关处理占比已经消失：
+
+![修复后 csum 相关处理占比消失](images/ceph/image8.png)
 
 ### 优化点：关闭 pvspinlock
 
-另外 perf 中看到 pvspinlock 也是一个优化点，它会影响 `__pv_queued_spin_lock_slowpath` 的处理占比。需要在宿主机上编辑 CVM 的配置文件来关闭它：
+另外 perf 中看到 pvspinlock 也是一个优化点：
+
+![perf 中 pvspinlock 占比较高](images/ceph/image9.png)
+
+它会影响 `__pv_queued_spin_lock_slowpath` 的处理占比。需要在宿主机上编辑 CVM 的配置文件来关闭它：
 
 ```xml
   <features>
@@ -159,19 +181,31 @@ for i in /sys/class/net/eth0/queues/tx-*/xps_cpus; do echo 0 > $i; done
 
 以上优化完后，进行 iperf 打流测试的结果：双向 iperf 打流，290-300Gbps 左右。
 
-业务 Rados 1M write 的测试结果基本符合预期。跟网络团队确认，限速是分开各自能到 200Gbps。
+![iperf 打流测试结果](images/ceph/image10.png)
 
-最后交付客户的测试结果，Ceph 性能压测基本可以贴近基准值。
+业务 Rados 1M write 的测试结果基本符合预期：
+
+![Rados 1M write 测试结果](images/ceph/image5.png)
+
+跟网络团队确认，限速是分开各自能到 200Gbps。
+
+最后交付客户的测试结果，Ceph 性能压测基本可以贴近基准值：
+
+![最终交付客户的测试结果](images/ceph/image12.png)
 
 ## 测试用例二：JuiceFS 场景
 
-同时客户反馈，测试用例二在如上已经调优的环境下，仍然跑不出很好的效果。
+同时客户反馈，测试用例二在如上已经调优的环境下，仍然跑不出很好的效果：
+
+![JuiceFS 场景测试结果概览](images/ceph/image13.png)
 
 测试用例使用 3 台 Ceph 存储集群不变，发压端变成了 JuiceFS vdbench 测试用例。跟之前的 Rados 不同，这次测试增加了单路连接压测和更多 block 大小的压测。
 
 ### 性能瓶颈分析
 
-从数据对比，我们发现客户的标准数据和我们环境的压测数据相比，单路小包压测明显性能更差。多路大包压测相比稍好，但也只达到客户的 60% 左右。
+从数据对比，我们发现客户的标准数据和我们环境的压测数据相比，单路小包压测明显性能更差。多路大包压测相比稍好，但也只达到客户的 60% 左右：
+
+![JuiceFS 压测详细数据对比](images/ceph/image14.png)
 
 1. 从数据上看，各项测试的最终吞吐结果都跟平均延迟强相关。延迟越低，吞吐量越高。
 
@@ -183,23 +217,49 @@ for i in /sys/class/net/eth0/queues/tx-*/xps_cpus; do echo 0 > $i; done
 
 ### 网络延迟瓶颈分析
 
-通过抓包分析相关请求行为，在部分压力下观察单个文件的写入交互过程可以发现：JuiceFS 在进行数据写入时，首先要跟 JuiceFS 的其他成员进行元数据的交互。
+通过抓包分析相关请求行为，在部分压力下观察单个文件的写入交互过程可以发现：
+
+![抓包分析：单个文件写入交互过程](images/ceph/image15.png)
+
+JuiceFS 在进行数据写入时，首先要跟 JuiceFS 的其他成员进行元数据的交互。
+
+![写入交互流程时序图](images/ceph/image16.png)
 
 简单分析来看：每一次元信息读写涉及 1.5 个 RTT ≈ 75us。最少的交互次数为 3 次直接可见的元数据操作，3 × 75 = 225us。Ceph 一个 RTT ≈ 50us，元数据如果是分布式同步的话，估计再加 2 个 RTT + 100us，Ceph 的主从同步也加 2 个 RTT + 100us。总体单次写入的纯网络消耗：225 + 50 + 100 + 100 = 475us。
 
-在一些场景下，整个数据包的交互过程会更长。跟踪一个 JuiceFS 上的程序打开文件的过程可以看到，部分请求是新建连接，会进行 3 次握手，第一次握手延迟就达到 200us+。这跟网络架构中 ping flood 首包延迟较高的特性相关。另外整个交互过程要经过多轮数据交互，导致 open 耗时达到 3.5ms，close 耗时达到 2.7ms，其中同步数据过程占 1.5ms，网络延迟导致的时间消耗在整个请求中占比更大。
+在一些场景下，整个数据包的交互过程会更长。跟踪一个 JuiceFS 上的程序打开文件的过程可以看到：
+
+![strace 跟踪 open/close 耗时](images/ceph/image17.png)
+
+对应的抓包信息：
+
+![Wireshark 抓包：open 和 close 交互过程](images/ceph/image18.png)
+
+部分请求是新建连接，会进行 3 次握手，第一次握手延迟就达到 200us+。这跟网络架构中 ping flood 首包延迟较高的特性相关。另外整个交互过程要经过多轮数据交互，导致 open 耗时达到 3.5ms，close 耗时达到 2.7ms，其中同步数据过程占 1.5ms，网络延迟导致的时间消耗在整个请求中占比更大。
 
 这一数据印证了压测数据与客户环境对比的差异：open 时间方面，客户平均 240us，测试环境为 548us；close 时间方面，客户平均 793us，测试环境为 1994us。
 
 **网络延迟瓶颈确认：**
 
+客户网络延迟：
+
+![客户环境 ping 结果：floodping 平均 14us](images/ceph/image19.png)
+
+我们的网络延迟：
+
+![测试环境 ping 结果：floodping 平均 48us](images/ceph/image20.png)
+
 从 floodping 的平均延迟看，我们的环境达到 48us，客户环境为 14us。
 
 ### CPU 性能瓶颈分析
 
-另外观察高并发大 IO 的服务器负载状态发现，超大文件并发 IO 时，顺序写性能从数据看起来是没问题的，但顺序读看起来低于预期，并且在压测时读端会有单核跑满现象，而且主要集中在 3-4 个核心上，服务器多核心并没有充分利用起来。
+另外观察高并发大 IO 的服务器负载状态发现，超大文件并发 IO 时，顺序写性能从数据看起来是没问题的，但顺序读看起来低于预期，并且在压测时读端会有单核跑满现象，而且主要集中在 3-4 个核心上，服务器多核心并没有充分利用起来：
 
-perf top 看，CPU 瓶颈也主要在内存 copy 和 libc 的 `__memmove_avx512_unaligned_erms` 上。
+![高并发大 IO 时读端单核跑满现象](images/ceph/image21.png)
+
+perf top 看，CPU 瓶颈也主要在内存 copy 和 libc 的 `__memmove_avx512_unaligned_erms` 上：
+
+![perf top：CPU 瓶颈在内存 copy](images/ceph/image22.png)
 
 另外从抓包的角度来看，Ceph 端的写入时间也达到 800-900us 左右。综合判断，JuiceFS 压测的主要瓶颈是网络延迟和单核 CPU 性能的综合影响。经确认，网络延迟在当前架构下已没有进一步提升的潜力，因此需要从 CPU 侧寻找优化空间来提升整体吞吐。
 
@@ -209,9 +269,13 @@ perf top 看，CPU 瓶颈也主要在内存 copy 和 libc 的 `__memmove_avx512_
 
 基于以上分析，我们将 CPU 绑核到 0-15，即前 16 个核心上进行测试对比。从 CPU 架构上看，前 16 个核心是共享 L3 Cache 的。
 
+![第一次优化：绑核到前 16 个核心的测试结果](images/ceph/image23.png)
+
 跟之前的数据对比发现，绑核之后写性能基本没有提升，部分大 IO 用例还有下降，但读性能有较大提升。这跟我们之前在读端看到的现象一致，说明缓存局部性的提升对读性能确实有帮助。
 
 写性能下降的原因，应该是 Ceph 端绑核之后不能充分发挥网络结构的最大吞吐性能，且无法充分利用更多核心。因此进一步调整策略：JuiceFS 端绑核到单独的 NUMA 节点上，而 Ceph 存储端采用 IRQ 双路 NUMA 绑核。
+
+![第二次优化：JuiceFS 端绑单 NUMA，Ceph 端双路 NUMA 绑核](images/ceph/image24.png)
 
 调整后，读写两端的性能均有提升，尤其是高并发大 IO 场景，已经可以达到客户标准性能。但小 IO 单路并发场景性能提升不明显。
 
@@ -226,6 +290,8 @@ spec_rstack_overflow=off
 ```
 
 关闭安全补丁后单核性能有所提升，单路小 IO 场景性能也有一定改善，但距离客户标准仍有较大差距。不过高并发大 IO 场景基本都已能达到客户标准。
+
+![关闭内核安全补丁后的测试结果](images/ceph/image25.png)
 
 ## 结论
 
