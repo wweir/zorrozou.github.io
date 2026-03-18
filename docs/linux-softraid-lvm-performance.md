@@ -382,29 +382,346 @@ batch write将多个连续stripe的写操作合并为一个大的写操作，减
 
 ### 3.5 Plug/Unplug机制：积攒IO再批量提交
 
-Linux块层有一个plug/unplug机制——先"塞住"IO不提交，积攒一批后再一起提交（unplug），目的是增加IO合并机会。RAID5专门实现了自己的plug机制：
+#### 块层plug/unplug的基本原理
+
+Linux块层有一个plug/unplug机制——先"塞住"IO不提交，积攒一批后再一起提交（unplug），目的是增加IO合并机会。这个概念类似浴缸的塞子：plug（塞住）时水（IO请求）不断积攒，unplug（拔掉）时一次性放出。
+
+在通用块层，plug/unplug的基本流程是这样的：
+
+```c
+/* block/blk-core.c */
+void blk_start_plug(struct blk_plug *plug)
+{
+    /* 将plug挂到当前进程的task_struct上 */
+    INIT_LIST_HEAD(&plug->mq_list);
+    ...
+    current->plug = plug;
+}
+
+void blk_finish_plug(struct blk_plug *plug)
+{
+    if (plug == current->plug) {
+        /* 拔掉塞子，提交所有积攒的IO */
+        __blk_flush_plug(plug, false);
+        current->plug = NULL;
+    }
+}
+```
+
+关键点在于：**plug是per-task的**——每个进程（线程）有自己独立的plug链表，在`blk_start_plug()`和`blk_finish_plug()`之间提交的所有IO都会被暂存，直到unplug时才真正下发到设备驱动。
+
+#### 没有plug会怎样？——逐个提交的问题
+
+要理解plug的价值，先看看没有plug时RAID5写IO的处理流程。假设应用层连续写入4个4KB块，恰好覆盖同一个stripe的全部数据盘：
+
+```
+【无plug——逐个提交模式】
+
+  应用连续写4个块（D0~D3），它们属于同一个stripe
+
+  时间线：
+  ─────────────────────────────────────────────────────>
+
+  D0到达RAID5层：
+    → 只有1/4数据，无法FSW
+    → 触发RMW：读旧D0 + 读旧P → 计算新P → 写D0 + 写P
+    → 代价：2读 + 2写
+
+  D1到达RAID5层：
+    → stripe_head上已有D0在处理中，但D0的RMW可能已经提交了
+    → D1又触发一次RMW：读旧D1 + 读旧P → 计算新P → 写D1 + 写P
+    → 代价：2读 + 2写
+
+  D2到达、D3到达... 同样的悲剧重复
+
+  总代价：4次RMW = 8读 + 8写 = 16次磁盘IO
+```
+
+每个写请求到达时，RAID5层看到stripe上只有部分数据，只能走RMW路径。即使应用层的意图是顺序写满整个stripe，由于请求一个一个提交，RAID5层无法感知到"后面还有更多数据要来"。
+
+#### 有plug时——批量到达，一次FSW
+
+现在看有plug时的情况：
+
+```
+【有plug——批量提交模式】
+
+  应用连续写4个块（D0~D3），它们属于同一个stripe
+
+  时间线：
+  ─────────────────────────────────────────────────────>
+
+  blk_start_plug()
+    │
+    ├── D0提交 → 暂存在plug链表
+    ├── D1提交 → 暂存在plug链表
+    ├── D2提交 → 暂存在plug链表
+    ├── D3提交 → 暂存在plug链表
+    │
+  blk_finish_plug() → unplug，4个请求一起下发到RAID5层
+    │
+    ├── D0~D3同时到达同一个stripe_head
+    ├── stripe_head发现所有数据盘都被覆盖
+    ├── 触发FSW（Full Stripe Write）！
+    └── 直接计算新P → 写D0+D1+D2+D3+P
+
+  总代价：0读 + 5写 = 5次磁盘IO
+```
+
+**从16次磁盘IO降到5次——这就是plug对RAID5写性能的核心价值。**
+
+关键差异不仅仅是IO次数的减少。FSW路径还有一个重要优势：**不需要等待读操作完成**。RMW的"先读后写"意味着写操作必须等读完成后才能开始计算奇偶校验，而FSW的所有数据都已经在内存中，可以立即计算并提交写操作。
+
+#### RAID5的专属plug实现
+
+通用块层的plug机制已经能积攒IO，但RAID5在此基础上实现了**自己的plug回调**，进一步优化了stripe级别的IO合并：
 
 ```c
 /* raid5.c */
 struct raid5_plug_cb {
     struct blk_plug_cb  cb;
-    struct list_head    list;   /* 积攒的stripe列表 */
+    struct list_head    list;   /* 积攒的stripe_head列表 */
     struct list_head    temp_inactive_list[NR_STRIPE_HASH_LOCKS];
 };
 
+static void
+raid5_make_request(struct mddev *mddev, struct bio *bi)
+{
+    ...
+    /* 尝试获取当前进程的RAID5 plug */
+    plug = container_of(cb, struct raid5_plug_cb, cb);
+    if (...) {
+        /* 如果当前进程有活跃的plug，把stripe_head
+         * 挂到plug的链表里，暂不提交处理 */
+        list_add_tail(&sh->lru, &plug->list);
+    } else {
+        /* 没有plug，直接提交处理 */
+        release_stripe_plug(mddev, sh);
+    }
+    ...
+}
+```
+
+这段代码的含义是：当一个bio到达RAID5层时，内核先找到对应的stripe_head，然后检查当前进程是否有活跃的plug。如果有，就把stripe_head暂存到plug的链表里而不立即处理；如果没有plug或者plug链表已满，就直接提交。
+
+unplug时的处理是这样的：
+
+```c
+/* raid5.c */
 static void raid5_unplug(struct blk_plug_cb *blk_cb, bool from_schedule)
 {
     struct raid5_plug_cb *cb = container_of(
         blk_cb, struct raid5_plug_cb, cb);
-    /* 将所有积攒的stripe一次性提交处理 */
+    struct stripe_head *sh;
+    struct mddev *mddev = cb->cb.data;
+    struct r5conf *conf = mddev->private;
+    int cnt = 0;
+
+    if (cb->list.next && !list_empty(&cb->list)) {
+        spin_lock_irq(&conf->device_lock);
+        while (!list_empty(&cb->list)) {
+            sh = list_first_entry(&cb->list,
+                struct stripe_head, lru);
+            list_del_init(&sh->lru);
+            /*
+             * 避免对每个stripe_head单独调用raid5_release_stripe，
+             * 而是批量处理——减少锁获取/释放的次数
+             */
+            __release_stripe(conf, sh, &cb->temp_inactive_list[...]);
+            cnt++;
+        }
+        spin_unlock_irq(&conf->device_lock);
+    }
+    /* 批量唤醒raid5d守护线程处理所有积攒的stripe */
+    release_inactive_stripe_list(conf, cb->temp_inactive_list, ...);
     ...
-    dispatch_bio_list(&tmp);
 }
 ```
 
-当上层以plug方式提交IO时，RAID5会把相关stripe积攒在`raid5_plug_cb`的链表里，等到unplug时一起处理，这样同一个stripe上的多个IO就有机会合并，尽量触发FSW。
+注意这里的关键优化：**unplug时不是逐个处理stripe_head，而是先批量收集到`temp_inactive_list`中，最后一次性唤醒`raid5d`守护线程**。这避免了反复获取/释放锁、反复唤醒守护线程的开销。
 
-> **建议5：应用层使用`fio`测试时加上`--io_submit_mode=offload`或使用libaio/io_uring批量提交，可以给RAID5更多的IO合并机会，提升顺序写性能。**
+#### 从全局视角看plug/unplug的IO路径
+
+把整个流程画出来：
+
+```
+【RAID5 plug/unplug 完整IO路径】
+
+  用户进程                      内核RAID5层                raid5d守护线程
+  ═══════                      ═══════════               ═══════════════
+
+  blk_start_plug()
+      │
+  write(D0)───────→ raid5_make_request()
+      │               ├ 找到stripe_head #100
+      │               └ 挂到plug->list ─→ [sh#100]
+  write(D1)───────→ raid5_make_request()
+      │               ├ stripe_head #100已在list
+      │               └ 更新sh#100的数据 ─→ [sh#100(D0,D1)]
+  write(D2)───────→ raid5_make_request()
+      │               ├ 同上
+      │               └ 更新sh#100 ─→ [sh#100(D0,D1,D2)]
+  write(D3)───────→ raid5_make_request()
+      │               ├ 同上
+      │               └ 更新sh#100 ─→ [sh#100(D0,D1,D2,D3)]
+      │
+  blk_finish_plug()
+      │
+      └──────────→ raid5_unplug()
+                      ├ 遍历plug->list
+                      ├ sh#100：所有数据盘已覆盖 → 标记FSW
+                      └ 批量提交 ──────────────→ handle_stripe()
+                                                   ├ is_full_stripe_write() = true
+                                                   ├ 直接计算新parity
+                                                   └ 提交5个写bio（D0+D1+D2+D3+P）
+```
+
+这里有一个细节值得注意：在plug期间，同一个stripe的多次写不会创建多个stripe_head，而是**累积到同一个stripe_head上**。这意味着plug不仅减少了IO次数，还减少了stripe_head的分配和回收开销。
+
+#### plug/unplug的触发时机
+
+了解plug在什么时候被启用和释放，对理解实际性能影响非常重要：
+
+| 场景 | plug行为 | 对RAID5的影响 |
+|------|---------|-------------|
+| **同步写（sync，如`write`+`fsync`）** | 内核VFS层自动plug/unplug | 单次write期间的多个bio可以合并 |
+| **buffered写** | 回写线程（writeback）会plug | 大批脏页一起提交，合并效果好 |
+| **direct IO + libaio/io_uring** | `io_submit()`批量提交时plug | 一次系统调用中的多个IO可以合并 |
+| **direct IO + 同步逐个write** | 每次write独立plug/unplug | plug效果有限，每个请求独立处理 |
+| **fio numjobs=1, iodepth=1** | 几乎无plug效果 | 每个IO独立处理，最差情况 |
+| **fio numjobs=1, iodepth=N** | libaio批量提交有plug | iodepth越大，plug积攒越多 |
+
+从这个表可以看到，**应用层的IO提交方式直接决定了plug能积攒多少IO**。如果应用每次只写一个块然后等完成再写下一个（典型的同步逐块写），plug几乎帮不上忙；而如果应用使用`io_uring`或`libaio`一次提交大量IO，plug就能充分发挥作用。
+
+#### plug积攒量与FSW触发率的关系
+
+plug的核心价值是增加FSW的触发率。我们可以从数学角度来理解这种关系。
+
+假设一个5盘RAID5（4数据盘），随机写4KB块（假设均匀分布在不同stripe上）：
+
+| plug积攒的IO数 | 同一stripe恰好收集满4块的概率 | 预期写路径 |
+|:--:|:--:|:--|
+| 1 | 0% | 必然RMW |
+| 4 | 约0.03%（4块恰好在同一stripe） | 几乎全是RMW |
+| 16 | 有限（取决于stripe_cache_size） | 少量合并 |
+| 1000+ | 显著（writeback场景） | 大量FSW |
+
+对于**随机写**，plug能积攒的IO数量通常有限（取决于iodepth），且分散在不同stripe上，FSW的触发率很低。但对于**顺序写**，情况完全不同——连续的写请求天然会命中相邻的stripe，plug积攒一小批就足够触发FSW。
+
+这也解释了一个常见现象：**RAID5的顺序写性能远好于随机写，且差距比单盘时更大**。在单盘上，顺序写和随机写的差异主要来自磁盘寻道和缓存命中率；而在RAID5上，还叠加了FSW vs RMW的路径差异——这个差异可以是数倍的。
+
+#### 与batch write机制的协同
+
+3.4节介绍了batch write——将多个连续stripe的FSW合并处理。plug机制是batch write能生效的**前提条件**：
+
+```
+【plug + batch write 协同】
+
+  没有plug时：
+    stripe#0 FSW → 提交 → stripe#1 FSW → 提交 → stripe#2 FSW → 提交
+    （每个stripe独立提交，无法batch）
+
+  有plug时：
+    plug期间积攒 → [stripe#0, stripe#1, stripe#2] → unplug
+    → stripe#0~#2连续地址 → stripe_can_batch() = true
+    → 合并为一个大的写操作 → 一次提交
+    （减少了2次dispatch开销和raid5d唤醒次数）
+```
+
+plug保证了多个stripe的请求**同时可见**，batch write才有机会检测到它们是连续的并合并处理。如果没有plug，每个stripe请求到达时前一个可能已经提交了，batch就无从谈起。
+
+> **建议5：应用层的IO提交方式直接决定RAID5能否充分利用plug机制。**
+>
+> - 使用`io_uring`或`libaio`的批量提交接口（`io_submit()`一次提交多个IO），可以最大化plug积攒量
+> - `fio`测试时增大`iodepth`（如32或64），让libaio引擎有足够的IO可以批量提交
+> - buffered IO场景下，调整`/proc/sys/vm/dirty_writeback_centisecs`和`dirty_expire_centisecs`控制回写批量大小
+> - 避免"写一个块等一个块"的同步IO模式——这会让plug完全失效，每个IO都走RMW
+
+#### 性能测试方案
+
+plug/unplug机制的效果可以通过对比不同IO提交方式的性能差异来间接观测：
+
+**方法1：对比不同iodepth的FSW触发率**
+
+iodepth直接影响plug能积攒多少IO。通过对比不同iodepth下的顺序写性能，可以观察plug的效果：
+
+```bash
+# 测试脚本：固定顺序写，改变iodepth
+for depth in 1 2 4 8 16 32 64 128; do
+  fio --name=plug_depth_test --filename=/dev/md0 \
+      --rw=write --bs=4k --iodepth=$depth --numjobs=1 \
+      --ioengine=libaio --direct=1 --runtime=60 --time_based \
+      --group_reporting --output-format=json \
+      --output=plug_depth_${depth}.json
+done
+```
+
+预期结果：
+- `iodepth=1`：每次只提交一个IO，plug几乎无效，性能最差
+- `iodepth=4~8`：开始有足够的IO填满stripe，FSW比例上升，性能跳跃式增长
+- `iodepth=32+`：FSW比例趋近饱和，性能增长趋缓
+
+关键指标：对比`iodepth=1`和`iodepth=32`的IOPS差异。如果差异超过2倍，说明plug带来的IO合并/FSW效果显著。
+
+**方法2：对比sync IO vs libaio批量提交**
+
+```bash
+# 同步IO引擎（psync）——每次写操作独立提交，plug效果最小
+fio --name=sync_test --filename=/dev/md0 \
+    --rw=write --bs=4k --iodepth=1 --numjobs=1 \
+    --ioengine=psync --direct=1 --runtime=60 --time_based \
+    --group_reporting --output-format=json \
+    --output=plug_psync.json
+
+# 异步IO引擎（libaio）——批量提交，充分利用plug
+fio --name=aio_test --filename=/dev/md0 \
+    --rw=write --bs=4k --iodepth=32 --numjobs=1 \
+    --ioengine=libaio --direct=1 --runtime=60 --time_based \
+    --group_reporting --output-format=json \
+    --output=plug_libaio.json
+
+# io_uring引擎——更高效的批量提交
+fio --name=uring_test --filename=/dev/md0 \
+    --rw=write --bs=4k --iodepth=32 --numjobs=1 \
+    --ioengine=io_uring --direct=1 --runtime=60 --time_based \
+    --group_reporting --output-format=json \
+    --output=plug_iouring.json
+```
+
+这组测试直接对比了三种IO引擎在RAID5上的写性能。`psync`（同步逐个写）是plug效果最差的情况，`libaio`和`io_uring`则能充分利用plug批量提交。
+
+**方法3：用blktrace直接观察IO合并效果**
+
+```bash
+# 在一个终端启动blktrace
+blktrace -d /dev/md0 -o plug_trace &
+
+# 在另一个终端运行写测试
+fio --name=trace_test --filename=/dev/md0 \
+    --rw=write --bs=4k --iodepth=32 --numjobs=1 \
+    --ioengine=libaio --direct=1 --runtime=10 --time_based
+
+# 停止blktrace后分析
+kill %1
+blkparse -i plug_trace -d plug_trace.bin
+btt -i plug_trace.bin -o plug_analysis
+```
+
+`btt`的输出会包含`Q2G`（请求排队到合并）和`D2C`（下发到完成）的延迟分布。如果plug工作良好，`Q2G`时间会较长（IO在plug中等待合并），但`D2C`时间会较短（合并后的IO更高效）。
+
+**方法4：通过/proc/mdstat观察stripe cache命中率**
+
+```bash
+# 运行测试时每秒采样stripe cache状态
+while true; do
+  echo "=== $(date +%H:%M:%S) ==="
+  cat /proc/mdstat | grep -A5 md0
+  cat /sys/block/md0/md/stripe_cache_active
+  sleep 1
+done
+```
+
+关注`stripe_cache_active`的变化。在plug有效的高iodepth场景下，活跃stripe_head数量会更稳定（同一个stripe_head被反复命中）；而在iodepth=1的逐个提交场景下，活跃stripe_head数量会频繁波动（每次分配新的stripe_head）。
 
 ### 3.6 stripe_cache的并发控制：hash锁
 
