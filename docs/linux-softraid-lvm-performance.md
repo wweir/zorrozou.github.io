@@ -416,9 +416,207 @@ DM需要为每个bio创建一个`dm_target_io`封装，这涉及slab分配器的
 
 ## 二、LVM条带化（dm-stripe）的性能分析
 
-### 2.1 条带化的核心：stripe_map_sector
+上一章我们了解了DM框架的整体架构，知道了`striped` target的map函数只做简单的取模+加法运算，IO路径极短。但这只是"怎么做"——条带化到底是什么？为什么需要它？它在什么情况下有用，什么情况下反而有害？本章将彻底讲清楚这些问题。
 
-LVM条带卷对应的target是`striped`，实现在`drivers/md/dm-stripe.c`。其核心数据结构是：
+### 2.1 什么是条带化？从一个性能瓶颈说起
+
+假设你有4块磁盘，要存储一个大文件。最简单的做法是用LVM的`linear`模式——先写满第一块盘，再写第二块，依次类推：
+
+```
+linear（线性拼接）：
+
+  逻辑地址空间：  [    0 ~ 999G     |  1000G ~ 1999G  |  2000G ~ 2999G  | 3000G ~ 3999G  ]
+                        │                  │                  │                  │
+                        ▼                  ▼                  ▼                  ▼
+  物理设备：         Disk 0             Disk 1             Disk 2             Disk 3
+
+  问题：访问 0~999G 的数据时，只有 Disk 0 在工作，其他 3 块盘完全空闲！
+```
+
+这就是linear模式的致命缺陷——**同一时刻只有一块盘在服务IO**。如果你的应用在集中读写某个区域的数据（这是大多数真实负载的特征），那其他盘就是白白浪费的。
+
+条带化（Striping）的思路正好相反：**把数据切成小块（chunk），像发牌一样轮流分配到各个磁盘**。这样，无论访问哪个区域的数据，多块盘都能同时工作：
+
+```
+striped（条带化）：chunk_size = 128KB
+
+  逻辑地址空间：  [ chunk0 | chunk1 | chunk2 | chunk3 | chunk4 | chunk5 | chunk6 | chunk7 | ... ]
+                     │        │        │        │        │        │        │        │
+                     ▼        ▼        ▼        ▼        ▼        ▼        ▼        ▼
+  物理设备：      Disk 0   Disk 1   Disk 2   Disk 3   Disk 0   Disk 1   Disk 2   Disk 3  ...
+
+                 ┌────────┬────────┬────────┬────────┐
+  Stripe 0  →   │chunk 0 │chunk 1 │chunk 2 │chunk 3 │  ← 4个chunk = 1个完整条带（512KB）
+                 ├────────┼────────┼────────┼────────┤
+  Stripe 1  →   │chunk 4 │chunk 5 │chunk 6 │chunk 7 │
+                 ├────────┼────────┼────────┼────────┤
+  Stripe 2  →   │chunk 8 │chunk 9 │chunk10 │chunk11 │
+                 └────────┴────────┴────────┴────────┘
+                  Disk 0    Disk 1   Disk 2   Disk 3
+```
+
+这里有两个关键概念需要明确：
+
+- **chunk（块）**：条带化的最小分配单元。一个chunk是连续分配到同一块磁盘的最小数据量。上图中每个chunk是128KB。
+- **stripe（条带）**：所有磁盘上同一行的chunk组合。上图中一个stripe = 4个chunk = 512KB。
+
+chunk_size的选择直接影响性能特征，我们后面会详细分析。
+
+### 2.2 条带化为什么能提升性能？
+
+理解了数据布局，性能提升的原理就很直观了。我们从三个维度来分析：
+
+#### 2.2.1 吞吐量：N块盘的带宽叠加
+
+顺序读一个大文件时，linear模式下数据全在一块盘上，吞吐量受限于单盘带宽。条带化后，一次大IO会被自动拆分到N块盘并行读取：
+
+```
+顺序读 1MB，chunk=128KB，4盘条带：
+
+  linear模式：
+    时间线 ──────────────────────────────────────────────────▶
+    Disk 0: [===== 读 1MB ======================================]
+    Disk 1: [                    空闲                           ]
+    Disk 2: [                    空闲                           ]
+    Disk 3: [                    空闲                           ]
+    总耗时: T = 1MB ÷ 单盘带宽
+
+  striped模式（4盘）：
+    时间线 ──────────────────▶
+    Disk 0: [= 读 256KB（chunk 0,4） =]
+    Disk 1: [= 读 256KB（chunk 1,5） =]
+    Disk 2: [= 读 256KB（chunk 2,6） =]
+    Disk 3: [= 读 256KB（chunk 3,7） =]
+    总耗时: T = 256KB ÷ 单盘带宽 ≈ 原来的 1/4
+
+  理论吞吐量提升：N倍（N = 条带数）
+```
+
+这就是条带化最直观的优势——**带宽叠加**。4块盘条带化，理论顺序吞吐量是单盘的4倍。
+
+#### 2.2.2 IOPS：随机IO的负载分散
+
+对于随机4K小IO，条带化的优势在于**负载分散**。由于chunk是轮流分配的，随机访问的IO会均匀分散到所有磁盘：
+
+```
+随机读 4K IO（假设IO均匀分布），4盘条带：
+
+  linear模式（数据集中在 Disk 0）：
+    Disk 0: [IO][IO][IO][IO][IO][IO][IO][IO]   ← 所有IO都打到一块盘
+    Disk 1: [                              ]
+    Disk 2: [                              ]
+    Disk 3: [                              ]
+    IOPS ≈ 单盘IOPS
+
+  striped模式：
+    Disk 0: [IO]    [IO]    [IO]    [IO]        ← 每块盘只承担 1/4 的IO
+    Disk 1:    [IO]    [IO]    [IO]    [IO]
+    Disk 2: [IO]    [IO]    [IO]    [IO]
+    Disk 3:    [IO]    [IO]    [IO]    [IO]
+    IOPS ≈ 4 × 单盘IOPS
+
+  理论IOPS提升：N倍（N = 条带数）
+```
+
+在我们前面第一章的实验数据中已经验证了这一点：4盘条带的随机读IOPS（2541）约为2盘条带（1217）的2倍，8盘条带（5289）约为4盘条带的2倍——几乎完美的线性扩展。
+
+#### 2.2.3 延迟：对单次IO没有帮助
+
+但条带化有一个常见的误解需要澄清：**它不能降低单次IO的延迟**。
+
+```
+单次随机读 4K：
+
+  linear模式：
+    请求 → Disk X → 响应     延迟 = T_disk
+
+  striped模式：
+    请求 → stripe_map() → Disk Y → 响应     延迟 = T_map + T_disk
+                           │
+                     只是换了一块盘而已
+
+  T_map ≈ 20ns，T_disk ≈ 数百μs（云盘）或数十μs（NVMe SSD）
+  条带化不会让单次IO变快——只是换了目标盘
+```
+
+条带化提升的是**聚合性能**（吞吐量和IOPS），而不是**单次延迟**。如果你的应用是单线程、串行IO，那条带化的收益很有限——因为同一时刻只有一个IO在飞行，只有一块盘在工作。
+
+这引出了一个重要的适用条件：**条带化需要足够的IO并发度才能发挥优势**。这个"足够"是多少？我们后面会给出测试方案。
+
+### 2.3 chunk_size的选择：条带化调优的核心
+
+chunk_size是条带化中最关键的参数，它直接影响IO的分布方式和性能特征。选错了chunk_size，条带化不仅不能提升性能，甚至可能带来负面影响。
+
+#### 2.3.1 chunk_size太小会怎样？
+
+如果chunk_size比IO大小还小，一次IO就会跨越多个chunk，被拆分到多个磁盘：
+
+```
+chunk_size = 4KB，单次顺序读 128KB：
+
+  逻辑IO：   [============= 128KB =============]
+  拆分后：   [4K][4K][4K][4K][4K][4K]...[4K][4K]   ← 32个4K IO
+              │   │   │   │   │   │       │   │
+              D0  D1  D2  D3  D0  D1      D0  D1
+
+  问题1：32个小IO代替1个大IO，磁盘寻道开销爆炸（HDD场景）
+  问题2：每个小IO都要走一次块层提交流程，CPU开销增大
+  问题3：磁盘队列被大量小IO填满，排队延迟上升
+```
+
+#### 2.3.2 chunk_size太大会怎样？
+
+如果chunk_size远大于IO大小，小IO就无法分散到多块盘，失去了条带化的意义：
+
+```
+chunk_size = 1MB，随机写 4KB：
+
+  写请求 A（逻辑地址 0x100）  → 落入 chunk 0 → Disk 0
+  写请求 B（逻辑地址 0x200）  → 落入 chunk 0 → Disk 0
+  写请求 C（逻辑地址 0x300）  → 落入 chunk 0 → Disk 0
+  ...
+  写请求 X（逻辑地址 0xFFFFF）→ 落入 chunk 0 → Disk 0
+  写请求 Y（逻辑地址 0x100000）→ 终于到 chunk 1 → Disk 1 ！
+
+  如果数据集中在一个 1MB 的范围内，所有IO都打到同一块盘
+  条带化完全退化为 linear
+```
+
+#### 2.3.3 最优chunk_size的选择原则
+
+最优的chunk_size取决于你的IO模式。核心原则是：
+
+**对于顺序IO**：chunk_size应该足够大，让一次IO尽量落在一块盘上，避免跨盘拆分开销。同时又不能太大，否则多块盘无法同时工作。一个好的平衡点是让chunk_size等于或略大于典型的IO大小。
+
+**对于随机小IO**：chunk_size应该较小，这样不同地址的IO更容易分散到不同盘上。但不能小于IO大小，否则会引起IO拆分。
+
+```
+chunk_size 选择速查表：
+
+  工作负载               推荐chunk_size       原因
+  ─────────────────────────────────────────────────────────────
+  数据库（8K/16K随机IO） 64KB ~ 128KB         足够小以分散IO，
+                                              不会拆分单次IO
+
+  大文件顺序读写         256KB ~ 1MB          减少跨盘拆分，
+                                              利用磁盘顺序带宽
+
+  混合负载               128KB ~ 256KB        折中选择
+
+  OLTP（4K随机为主）     32KB ~ 64KB          最大化IO分散度
+
+  流媒体/视频处理        512KB ~ 1MB          大块顺序IO为主
+```
+
+一个实用的经验法则：**chunk_size = 典型IO大小 × (2~4)**。对于大多数通用场景，128KB是一个安全的默认值。
+
+> **建议1：chunk_size应匹配应用IO模式，而非盲目使用默认值。**
+>
+> LVM默认的chunk大小为64KB（`lvcreate -i 4 -I 64k`）。对于大多数数据库和通用服务器负载，这是合理的。但如果你的应用以大块顺序IO为主（如视频处理、数据仓库），应增大到256KB甚至更大。可以用`iostat -x 1`观察应用的avgqu-sz和avgrq-sz来判断典型IO大小。
+
+### 2.4 stripe_map_sector：内核如何实现地址映射
+
+理解了条带化的概念，让我们深入看内核的具体实现。LVM条带卷对应的target是`striped`，实现在`drivers/md/dm-stripe.c`。其核心数据结构是：
 
 ```c
 struct stripe_c {
@@ -460,17 +658,45 @@ static void stripe_map_sector(struct stripe_c *sc, sector_t sector,
 }
 ```
 
+这段代码的核心逻辑用一句话概括就是：**给定逻辑扇区号，通过两次"除法+取模"运算，算出该扇区应该映射到哪块物理磁盘的哪个位置**。让我们用图来展示这个过程：
+
+```
+stripe_map_sector 的地址映射过程（4盘条带，chunk=128KB=256扇区）：
+
+  输入：逻辑扇区号 = 1234
+
+  Step 1: 计算chunk编号和chunk内偏移
+          chunk编号   = 1234 ÷ 256 = 4      （第5个chunk）
+          chunk内偏移 = 1234 % 256 = 210     （chunk内的第210个扇区）
+
+  Step 2: 计算目标磁盘和磁盘内chunk编号
+          目标磁盘      = 4 % 4 = 0          （映射到 Disk 0）
+          磁盘内chunk号 = 4 ÷ 4 = 1          （Disk 0 上的第2个chunk）
+
+  Step 3: 计算物理扇区号
+          物理扇区 = 磁盘内chunk号 × chunk_size + chunk内偏移
+                   = 1 × 256 + 210 = 466
+
+  输出：Disk 0，物理扇区 466
+
+  验证（在数据布局图中定位）：
+                 Disk 0     Disk 1     Disk 2     Disk 3
+                ┌──────────┬──────────┬──────────┬──────────┐
+  Stripe 0  →  │ chunk 0  │ chunk 1  │ chunk 2  │ chunk 3  │
+                ├──────────┼──────────┼──────────┼──────────┤
+  Stripe 1  →  │ chunk 4  │ chunk 5  │ chunk 6  │ chunk 7  │  ← 逻辑chunk 4
+                │  ▲       │          │          │          │     在Disk 0
+                │  └─扇区466          │          │          │     的第2个chunk内
+                └──────────┴──────────┴──────────┴──────────┘
+```
+
 这里有一个很有意思的优化细节：**当chunk_size和stripes数量都是2的幂时，内核用位运算（`&`和`>>`）代替除法（`sector_div`）来完成取模和除法运算**。这就是`chunk_size_shift`和`stripes_shift`这两个字段的意义——在条带化配置时预计算好移位量，在IO热路径中就不需要做昂贵的除法了。
 
-这也给我们提供了第一个调优建议：
-
-> **建议1：创建LVM条带卷时，条带数量（`-i`）和chunk大小（`-I`）都应该使用2的幂。**
->
-> 例如使用2、4、8块盘条带化，chunk大小使用64KB、128KB、256KB，而不是3块盘、96KB这样的非2的幂配置。非2的幂会导致内核在每次IO时执行除法操作，在极高IOPS场景下可能产生额外开销。
+那么实际场景中，位运算 vs 除法的性能差异到底有多大？
 
 #### 实验验证：位运算 vs 除法到底差多少？
 
-上面的分析是从源码角度给出的建议，那么问题来了——这个优化在实际IO场景中，到底能带来多大的性能差异？是显著差异还是理论上的差异？我们需要用数据说话。
+上面的分析是从源码角度给出的优化建议，那么问题来了——这个优化在实际IO场景中，到底能带来多大的性能差异？是显著差异还是理论上的差异？我们需要用数据说话。
 
 为了回答这个问题，我们设计了一组对照实验。由于标准的`lvcreate`命令不支持创建非2的幂的chunk大小，我们通过`dmsetup`直接创建striped target来绕过这个限制，这样就能精确控制stripes和chunk_size两个变量，分别测试2的幂与非2的幂配置的性能差异。
 
@@ -540,9 +766,9 @@ fio测试参数：runtime=60s，size=10G，每种负载跑3轮取平均值。随
 
 需要注意的是，本文的测试是在云盘（virtio-blk）环境下进行的，单盘IO延迟本身就在毫秒级。对于使用NVMe SSD或Intel Optane这类超低延迟设备的场景，单次IO延迟可以低至微秒级，此时CPU路径上的开销占比会更大一些。如果你的环境是这类设备且IOPS非常高（百万级），建议自行验证。但即便如此，2的幂的建议仍然是合理的工程实践——它不会带来坏处，而且内核代码确实为此做了优化。
 
-### 2.2 io_hints：告诉上层最优IO大小
+### 2.5 io_hints：告诉上层最优IO大小
 
-`dm-stripe.c`实现了`stripe_io_hints()`：
+`dm-stripe.c`实现了`stripe_io_hints()`，这个函数的作用是向上层（文件系统、IO调度器）通告条带设备的最优IO参数：
 
 ```c
 static void stripe_io_hints(struct dm_target *ti,
@@ -556,9 +782,24 @@ static void stripe_io_hints(struct dm_target *ti,
 }
 ```
 
-`io_opt`（optimal IO size）告诉上层文件系统：每次IO的最优大小是`chunk_size × 条带数`，即一个完整的RAID条带大小。如果IO大小等于这个值，每个底层设备都能被均匀地访问一次，并发度最高，效率最优。
+这里设置了两个关键参数：
 
-> **建议2：创建文件系统时，`stripe_unit`和`stripe_width`参数应匹配LVM条带配置。**
+- **`io_min`（最小IO大小）= chunk_size**：告诉上层，小于这个大小的IO无法被进一步优化。文件系统的allocator应避免产生小于一个chunk的IO。
+- **`io_opt`（最优IO大小）= chunk_size × 条带数**：告诉上层，每次IO的最优大小是一个完整stripe。如果IO大小等于这个值，每个底层设备都能被均匀地访问一次，并发度最高，效率最优。
+
+这些参数会通过sysfs暴露给用户空间：
+
+```bash
+# 查看条带设备的IO参数
+$ cat /sys/block/dm-0/queue/minimum_io_size    # io_min
+131072                                          # = 128KB (1个chunk)
+$ cat /sys/block/dm-0/queue/optimal_io_size     # io_opt
+524288                                          # = 512KB (4 × 128KB，完整条带)
+```
+
+文件系统在格式化时会读取这些参数来自动对齐。例如ext4的`mke2fs`会自动计算stride和stripe_width。但自动探测并不总是可靠的（特别是在多层DM堆叠的场景下），所以手动指定是更保险的做法。
+
+> **建议2：创建文件系统时，`stride`和`stripe_width`参数应匹配LVM条带配置。**
 >
 > 以ext4为例，如果创建了4块盘、chunk=128KB的条带卷：
 > ```bash
@@ -567,14 +808,249 @@ static void stripe_io_hints(struct dm_target *ti,
 > # stride = chunk_size / block_size = 128K / 4K = 32
 > # stripe_width = stride * 条带数 = 32 * 4 = 128
 > ```
-> 这样ext4在分配block group和做预读时就会按条带对齐，避免跨条带的读-改-写。
+> 这样ext4在分配block group和做预读时就会按条带对齐，避免跨条带边界的IO拆分。XFS也有类似的参数：
+> ```bash
+> mkfs.xfs -d su=128k,sw=4 /dev/vg/lv_stripe
+> # su = stripe unit = chunk_size
+> # sw = stripe width = 条带数
+> ```
 
-### 2.3 条带化的适用场景
+### 2.6 条带化的适用场景与局限性
 
-由于`dm-stripe`本身没有奇偶校验计算，IO路径极短，适合**对写性能要求高、不需要冗余保护**的场景，如：
-- 临时数据目录（日志、缓存）
-- 已有上层冗余保证的分布式存储底层
-- 数据库的临时表空间
+#### 2.6.1 适合使用条带化的场景
+
+由于`dm-stripe`本身没有奇偶校验计算，IO路径极短（纯地址映射，不产生额外IO），适合以下场景：
+
+**场景一：临时数据/缓存——追求极致吞吐，不需要冗余**
+
+```bash
+# 4块盘条带化，用于数据库临时表空间
+lvcreate -i 4 -I 128k -L 200G -n lv_temp vg_data
+mkfs.xfs -d su=128k,sw=4 /dev/vg_data/lv_temp
+mount /dev/vg_data/lv_temp /tmp/db_temp
+```
+
+临时数据丢了就丢了——数据库重启后会重建。条带化让临时表的排序、join操作速度提升N倍。
+
+**场景二：分布式存储底层——上层已有冗余保障**
+
+如果你在Ceph OSD或HDFS DataNode之上已经有了副本机制（3副本或纠删码），底层的单机存储就不需要RAID冗余了。这时条带化是最好的选择——获得多盘的性能，冗余交给上层。
+
+**场景三：已有硬件RAID保护的场景**
+
+如果底层已经有硬件RAID控制器提供了磁盘冗余，在LVM层再做软RAID是多余的。条带化可以把多个硬件RAID组的带宽叠加起来。
+
+#### 2.6.2 不适合使用条带化的场景
+
+**场景一：单线程、低并发IO**
+
+前面分析过，条带化的优势来自并行度。如果应用是单线程串行IO（例如某些备份程序），同一时刻只有一个IO在飞行，那条带化几乎没有收益：
+
+```
+单线程串行IO：
+  时间线 ─────────────────────────────────────────────▶
+  线程:    [submit IO1][等...][submit IO2][等...][submit IO3]
+  Disk 0:  [IO1]                          [IO3]
+  Disk 1:              [IO2]
+  Disk 2:                                         
+  Disk 3:
+
+  每个时刻只有1块盘在工作——条带化的4块盘中有3块在空闲
+  性能 ≈ 单盘性能（条带化白费了）
+```
+
+**场景二：需要数据保护的持久化存储**
+
+条带化没有任何冗余——任何一块盘故障，整个卷的数据全部丢失。而且由于数据分散在所有盘上，一块盘坏意味着每个文件都可能损坏。这比linear模式还糟糕（linear模式下一块盘坏只影响该盘上的数据）。
+
+```
+磁盘故障的影响：
+
+  linear模式（4盘拼接）：
+    Disk 0: [数据A]    Disk 1: [数据B]    Disk 2: [数据C☠]    Disk 3: [数据D]
+    Disk 2 坏了 → 只丢失数据C，其他完好
+
+  striped模式（4盘条带）：
+    Disk 0: [A₀][B₀][C₀]    Disk 1: [A₁][B₁][C₁]    Disk 2: [A₂☠][B₂☠][C₂☠]    Disk 3: [A₃][B₃][C₃]
+    Disk 2 坏了 → 文件A、B、C的每1/4数据都丢了 → 所有文件全部损坏！
+```
+
+如果需要数据保护，请使用RAID1/5/6（承受性能代价换取冗余），这正是我们第三章要深入分析的内容。
+
+#### 2.6.3 条带化 vs RAID5：性能与安全的取舍
+
+这两种方案的核心取舍可以用一张表总结：
+
+| 特性 | dm-stripe（条带化） | dm-raid（RAID5） |
+|------|:------------------:|:----------------:|
+| **写路径** | 纯地址映射（~20ns） | RMW/FSW（额外读+XOR计算） |
+| **写放大** | 1x | RMW最差4x，FSW约1.2x |
+| **额外IO** | 无 | 需读旧数据/旧校验 |
+| **CPU开销** | 几乎为零 | XOR/P+Q校验计算 |
+| **随机写性能** | ≈ N × 单盘 | ≈ (0.25~0.5) × N × 单盘 |
+| **顺序写性能** | ≈ N × 单盘 | ≈ (0.5~0.8) × N × 单盘 |
+| **数据冗余** | ❌ 无（一盘坏全丢） | ✅ 容忍1盘故障（RAID5） |
+| **容量利用率** | 100% | (N-1)/N |
+| **适用场景** | 临时数据、上层有冗余 | 需要持久化保护的数据 |
+
+**性能差距在随机写上最为显著**。条带化的随机写就是简单地分发到目标盘，而RAID5的随机写需要走RMW路径——每个写IO产生3-4个额外IO（读旧数据、读旧校验、写新数据、写新校验）。这就是为什么我们在第三章要花大量篇幅分析如何触发FSW来减少RAID5的写放大。
+
+### 2.7 条带化的性能测试方案
+
+要验证条带化的性能特征，需要从多个维度进行测试。以下是完整的测试方案：
+
+#### 方法1：条带数扩展性测试——验证线性扩展
+
+```bash
+#!/bin/bash
+# 测试不同条带数的性能扩展性
+# 预期结果：IOPS和吞吐量应与条带数成线性关系
+
+DISKS="/dev/vdb /dev/vdc /dev/vdd /dev/vde /dev/vdf /dev/vdg /dev/vdh /dev/vdi"
+
+for n in 1 2 4 6 8; do
+    # 取前n个磁盘
+    selected=$(echo $DISKS | tr ' ' '\n' | head -n $n | tr '\n' ' ')
+    
+    # 创建条带卷
+    pvcreate $selected 2>/dev/null
+    vgcreate vg_test $selected 2>/dev/null
+    lvcreate -i $n -I 128k -l 100%FREE -n lv_test vg_test
+    
+    echo "=== 条带数: $n ==="
+    
+    # 随机读4K
+    fio --name=randread --filename=/dev/vg_test/lv_test \
+        --ioengine=libaio --direct=1 --bs=4k --iodepth=128 \
+        --numjobs=4 --runtime=60 --rw=randread \
+        --group_reporting --output-format=json \
+        > stripe_${n}_randread.json
+    
+    # 顺序读1M
+    fio --name=seqread --filename=/dev/vg_test/lv_test \
+        --ioengine=libaio --direct=1 --bs=1M --iodepth=16 \
+        --numjobs=1 --runtime=60 --rw=read \
+        --group_reporting --output-format=json \
+        > stripe_${n}_seqread.json
+    
+    # 随机写4K
+    fio --name=randwrite --filename=/dev/vg_test/lv_test \
+        --ioengine=libaio --direct=1 --bs=4k --iodepth=128 \
+        --numjobs=4 --runtime=60 --rw=randwrite \
+        --group_reporting --output-format=json \
+        > stripe_${n}_randwrite.json
+    
+    # 清理
+    lvremove -f vg_test/lv_test
+    vgremove -f vg_test
+    pvremove $selected 2>/dev/null
+done
+```
+
+#### 方法2：chunk_size影响测试——找到最优chunk
+
+```bash
+#!/bin/bash
+# 固定4盘条带，改变chunk大小，观察对不同IO模式的影响
+# 预期：小IO随机负载对chunk不敏感，大IO顺序负载对chunk敏感
+
+for chunk in 32k 64k 128k 256k 512k 1024k; do
+    lvcreate -i 4 -I $chunk -l 100%FREE -n lv_test vg_test
+    
+    echo "=== chunk_size: $chunk ==="
+    
+    # 4K随机读：应该对chunk不敏感
+    fio --name=rand4k --filename=/dev/vg_test/lv_test \
+        --ioengine=libaio --direct=1 --bs=4k --iodepth=128 \
+        --numjobs=4 --runtime=60 --rw=randread \
+        --group_reporting --output-format=json \
+        > chunk_${chunk}_rand4k.json
+    
+    # 128K顺序读：chunk越大越有利（减少跨盘拆分）
+    fio --name=seq128k --filename=/dev/vg_test/lv_test \
+        --ioengine=libaio --direct=1 --bs=128k --iodepth=16 \
+        --numjobs=1 --runtime=60 --rw=read \
+        --group_reporting --output-format=json \
+        > chunk_${chunk}_seq128k.json
+    
+    # 混合读写（70/30）：模拟真实负载
+    fio --name=mixed --filename=/dev/vg_test/lv_test \
+        --ioengine=libaio --direct=1 --bs=8k --iodepth=64 \
+        --numjobs=4 --runtime=60 --rw=randrw --rwmixread=70 \
+        --group_reporting --output-format=json \
+        > chunk_${chunk}_mixed.json
+    
+    lvremove -f vg_test/lv_test
+done
+```
+
+#### 方法3：IO并发度影响测试——验证条带化需要并发
+
+```bash
+#!/bin/bash
+# 固定4盘条带 vs 单盘，改变iodepth，观察并发度的影响
+# 预期：低并发时条带化优势不明显，高并发时优势显著
+
+for depth in 1 2 4 8 16 32 64 128; do
+    echo "=== iodepth: $depth ==="
+    
+    # 单盘
+    fio --name=single --filename=/dev/vdb \
+        --ioengine=libaio --direct=1 --bs=4k --iodepth=$depth \
+        --numjobs=1 --runtime=60 --rw=randread \
+        --group_reporting --output-format=json \
+        > depth_${depth}_single.json
+    
+    # 4盘条带
+    fio --name=stripe4 --filename=/dev/vg_test/lv_test \
+        --ioengine=libaio --direct=1 --bs=4k --iodepth=$depth \
+        --numjobs=1 --runtime=60 --rw=randread \
+        --group_reporting --output-format=json \
+        > depth_${depth}_stripe4.json
+done
+
+# 分析：绘制 IOPS vs iodepth 曲线
+# 单盘在某个iodepth后饱和，条带卷的饱和点应该是单盘的N倍
+```
+
+#### 方法4：条带化 vs RAID5 写性能对比
+
+```bash
+#!/bin/bash
+# 条带化 vs RAID5 在不同写负载下的性能对比
+# 预期：随机写差距最大，顺序大IO写差距较小（RAID5走FSW路径）
+
+# 准备：分别创建4盘条带和4盘RAID5（3数据+1校验）
+# lvcreate -i 4 -I 128k ...   → stripe卷
+# lvcreate --type raid5 -i 3 -I 128k ...  → RAID5卷
+
+for rw in randwrite write; do
+    for bs in 4k 64k 256k 1M; do
+        echo "=== $rw bs=$bs ==="
+        
+        # 条带化
+        fio --name=stripe --filename=/dev/vg_test/lv_stripe \
+            --ioengine=libaio --direct=1 --bs=$bs --iodepth=64 \
+            --numjobs=4 --runtime=60 --rw=$rw \
+            --group_reporting --output-format=json \
+            > vs_stripe_${rw}_${bs}.json
+        
+        # RAID5
+        fio --name=raid5 --filename=/dev/vg_test/lv_raid5 \
+            --ioengine=libaio --direct=1 --bs=$bs --iodepth=64 \
+            --numjobs=4 --runtime=60 --rw=$rw \
+            --group_reporting --output-format=json \
+            > vs_raid5_${rw}_${bs}.json
+    done
+done
+
+# 关注点：
+# 1. randwrite 4k：RAID5走RMW，差距最大（可能4-8倍）
+# 2. write 1M：RAID5可能走FSW，差距缩小（可能1.5-2倍）
+# 3. 对比CPU使用率：RAID5的XOR计算会消耗额外CPU
+```
+
+理解了条带化的原理、优势和局限性，我们就可以进入更复杂的领域了——下一章将深入分析软RAID5/6，看看当引入奇偶校验和数据冗余后，IO路径会变得多么复杂，以及有哪些方法可以优化它的写性能。
 
 ---
 
