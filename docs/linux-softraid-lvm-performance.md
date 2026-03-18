@@ -423,7 +423,177 @@ struct r5conf {
 };
 ```
 
-8个哈希锁将stripe按sector地址分散到不同的锁桶，减少多线程并发访问时的锁竞争。对于高并发随机写场景，这是一个重要的可扩展性设计。
+#### 为什么需要hash锁？——从单锁瓶颈说起
+
+在早期的内核实现中（3.13之前），整个stripe cache只有**一把全局自旋锁**（`device_lock`）。每次查找、插入、释放stripe_head都要先获取这把锁。在单核或低并发场景下这没问题，但随着多核CPU和高速NVMe设备的普及，这把全局锁成了严重的性能瓶颈：
+
+```
+【单锁模型——所有CPU争抢一把锁】
+
+    CPU0         CPU1         CPU2         CPU3
+      |            |            |            |
+      v            v            v            v
+  +--------------------------------------------+
+  |           device_lock (全局锁)              |
+  |  ┌──────────────────────────────────────┐  |
+  |  │     stripe cache hash table          │  |
+  |  │  bucket[0] → sh → sh → ...          │  |
+  |  │  bucket[1] → sh → sh → ...          │  |
+  |  │  bucket[2] → sh → sh → ...          │  |
+  |  │  ...                                 │  |
+  |  └──────────────────────────────────────┘  |
+  +--------------------------------------------+
+
+  问题：4个CPU同时处理不同stripe的IO请求，
+  但每次操作都必须排队获取 device_lock。
+  在32核/64核系统上，锁争用导致大量CPU空转。
+```
+
+当多个CPU核心同时处理IO请求时（比如32路并发随机写），每个请求都需要在stripe hash table中查找或分配stripe_head。如果所有CPU都在争抢同一把锁，实际的并发度被锁序列化为1——即使有32个核心，同一时刻也只有一个核心能操作stripe cache，其余31个核心都在自旋等待。
+
+#### hash锁如何解决？——分段锁（Lock Striping）
+
+内核的解决方案是**分段锁**（Lock Striping）：将stripe hash table按hash值分成`NR_STRIPE_HASH_LOCKS`（8）个分段，每段有自己独立的自旋锁。不同分段的操作可以完全并行。
+
+```c
+/* raid5.c: stripe_head的hash计算 */
+static inline struct hlist_head *stripe_hash(struct r5conf *conf, sector_t sect)
+{
+    /* 通过sector地址计算hash桶编号 */
+    int hash = (sect >> RAID5_STRIPE_SHIFT(conf)) & STRIPE_HASH_LOCKS_MASK;
+    return &conf->stripe_hashtbl[hash];
+}
+```
+
+核心思想是：**不同sector地址的stripe_head大概率落在不同的hash桶中，因此只需要锁住对应的桶，而不是整个hash表。**
+
+```
+【分段锁模型——每个桶有独立的锁】
+
+  CPU0         CPU1         CPU2         CPU3
+    |            |            |            |
+    v            v            v            v
+  hash_lock[0]  hash_lock[1]  hash_lock[2]  hash_lock[3]
+    |            |            |            |
+    v            v            v            v
+  bucket[0,8,16..]  bucket[1,9,17..]  bucket[2,10,18..]  bucket[3,11,19..]
+  → sh → sh        → sh → sh          → sh → sh          → sh → sh
+
+  关键改进：4个CPU访问不同桶时，完全无锁争用，真正并行！
+  只有两个CPU恰好访问同一个桶时才需要等待。
+```
+
+具体来说，当一个IO请求进入RAID5层时，处理流程变成：
+
+1. **计算hash**：根据请求的sector地址，计算出该stripe应该在哪个hash桶（`sect >> STRIPE_SHIFT & 0x7`）
+2. **只锁对应桶**：获取`hash_locks[bucket_id]`，而不是全局锁
+3. **查找/操作**：在该桶的链表中查找stripe_head，执行插入/引用/释放
+4. **释放桶锁**：操作完成后释放
+
+由于8个桶的锁是完全独立的，最多可以有8个CPU核心同时操作stripe cache而完全无锁争用。
+
+#### 并发度提升的量化分析
+
+假设有N个CPU核心同时发起IO请求，每个请求需要操作stripe cache，锁的持有时间为t：
+
+| 模型 | 最大并行度 | N核争用概率 | 有效吞吐 |
+|------|-----------|-----------|---------|
+| 单全局锁 | 1 | 100%（N>1时必争用） | 受限于1/t |
+| 8分段锁 | 8 | N≤8时约 1-(7/8)^(N-1) | 受限于8/t |
+
+用生日悖论类比：8个桶，N个请求随机分配，发生冲突（两个请求落在同一个桶）的概率：
+- 2个并发请求：冲突概率 ≈ 12.5%（1/8）
+- 4个并发请求：冲突概率 ≈ 41%
+- 8个并发请求：冲突概率 ≈ 75%
+
+但即使在8个并发请求、75%概率有某对冲突的情况下，平均也有5~6个请求可以同时进行——这远好于单锁模型下的"只有1个能执行"。
+
+#### 为什么是8个锁？
+
+`NR_STRIPE_HASH_LOCKS=8`是内核开发者经过权衡选择的经验值：
+
+- **太少（如2个）**：锁争用改善有限，多核场景下仍然是瓶颈
+- **太多（如256个）**：每个锁对应的stripe太少，锁本身的内存开销和cache line占用增大；且unplug时需要遍历更多的分段，增加延迟
+- **8个**：在主流服务器CPU（8~64核）上，锁争用已显著降低，同时内存开销仅8个`spinlock_t`（约256~512字节），cache友好
+
+值得注意的是，`NR_STRIPE_HASH_LOCKS`是编译时常量（`#define`），**不可运行时调优**。如果你的场景确实需要更高的并行度（比如128核CPU + 高速NVMe组RAID5），可以通过修改内核头文件重新编译。
+
+#### 与plug/unplug机制的协同
+
+回顾3.5节的plug/unplug机制，`raid5_plug_cb`中也使用了按hash锁分段的临时链表：
+
+```c
+struct raid5_plug_cb {
+    struct blk_plug_cb  cb;
+    struct list_head    list;
+    struct list_head    temp_inactive_list[NR_STRIPE_HASH_LOCKS];  /* 每个锁桶一条链表 */
+};
+```
+
+unplug时，每个桶的stripe可以独立处理，进一步减少了锁的持有时间。这是一个精心设计的**lock-per-bucket**全局一致方案——从IO进入（plug时按hash分桶积攒）到IO处理（unplug时按桶独立提交），锁粒度始终保持在桶级别。
+
+#### 性能测试方案
+
+由于`NR_STRIPE_HASH_LOCKS`是编译时常量，要严格A/B测试需要用不同的内核。但我们可以通过**间接方法**观察hash锁的效果：
+
+**方法1：对比不同并发度下的扩展性曲线**
+
+固定RAID5配置，逐步增加fio的`numjobs`（1→2→4→8→16→32），观察IOPS是否线性增长：
+
+```bash
+# 测试脚本示例
+for jobs in 1 2 4 8 16 32; do
+  fio --name=hash_lock_test --filename=/dev/md0 \
+      --rw=randwrite --bs=4k --iodepth=32 --numjobs=$jobs \
+      --ioengine=libaio --direct=1 --runtime=60 --time_based \
+      --group_reporting --output-format=json \
+      --output=hashlock_jobs${jobs}.json
+done
+```
+
+如果hash锁工作良好：
+- 1→8 jobs：IOPS应接近线性增长（受益于8个独立锁桶）
+- 8→16→32 jobs：增长曲线开始变平（8个锁桶成为新瓶颈）
+
+如果hash锁不起作用（退化为单锁）：
+- 1→2 jobs时IOPS增长就会明显放缓
+
+**方法2：使用perf/lockstat观察锁争用**
+
+```bash
+# 开启锁统计（需要内核编译时开启CONFIG_LOCK_STAT）
+echo 1 > /proc/sys/kernel/lock_stat
+
+# 运行高并发写测试
+fio --name=test --filename=/dev/md0 --rw=randwrite --bs=4k \
+    --iodepth=64 --numjobs=16 --ioengine=libaio --direct=1 \
+    --runtime=30 --time_based
+
+# 查看RAID5相关的锁争用统计
+grep -A5 'hash_lock\|stripe_lock\|device_lock' /proc/lock_stat
+```
+
+关注指标：
+- `contentions`：锁争用次数
+- `waittime-avg`：平均等待时间
+- `holdtime-avg`：平均持有时间
+
+**方法3：通过ebpf/bpftrace追踪**
+
+```bash
+# 追踪hash_lock的获取和释放
+bpftrace -e '
+  kprobe:raid5_get_active_stripe {
+    @start[tid] = nsecs;
+  }
+  kretprobe:raid5_get_active_stripe /@start[tid]/ {
+    @latency_ns = hist(nsecs - @start[tid]);
+    delete(@start[tid]);
+  }
+'
+```
+
+在不同`numjobs`下对比`raid5_get_active_stripe`的延迟分布：并发越高，如果锁争用严重，该函数的延迟尾部（P99/P999）会显著增大。
 
 ### 3.7 RAID算法选择（RAID5布局）
 
