@@ -1147,32 +1147,491 @@ if (atomic_read(&conf->pending_full_writes) == 0))
 
 ### 3.3 RMW vs RCW：两种非全条带写策略
 
-当写操作不是FSW时，RAID5有两种策略：
+上一节讲到，Full Stripe Write是RAID5的理想写路径——所有数据盘都被覆盖，直接算出新奇偶校验写入即可。但现实中，大部分写操作只修改stripe中的一部分数据块。这时RAID5面临一个核心难题：**怎样用最少的额外IO算出新的奇偶校验？**
 
-**RMW（Read-Modify-Write）**：
-1. 读出当前数据块（old data）
-2. 读出当前奇偶校验块（old parity）
-3. 计算新奇偶：`new_parity = old_parity XOR old_data XOR new_data`
-4. 写入新数据和新奇偶
-- 代价：2次读（data + parity）+ 2次写
-- 适合：修改的数据块占少数时
+内核提供了两种策略：RMW（Read-Modify-Write）和RCW（Reconstruct Write）。它们解决的是同一个问题，但"读什么、算什么"完全不同。
 
-**RCW（Reconstruct Write）**：
-1. 读出所有未被修改的数据块
-2. 利用所有新旧数据重新计算奇偶
-3. 写入新数据和新奇偶
-- 代价：(N-1-修改块数)次读 + 写
-- 适合：修改的数据块占多数时（超过一半）
+#### 3.3.1 RMW：读旧值，差分更新奇偶校验
 
-内核根据修改的数据块数量选择策略：
+RMW的核心思想是**差分计算**——利用XOR的自消性质，只需要知道"变化了什么"就能更新奇偶校验：
+
+```
+XOR的关键性质：A XOR A = 0（任何值与自身异或得零）
+
+因此：
+  new_parity = old_parity XOR old_data XOR new_data
+
+证明：
+  设原始数据为 D0, D1, D2, D3，校验为 P = D0 XOR D1 XOR D2 XOR D3
+  现在只修改 D1 → D1'，新校验 P' = D0 XOR D1' XOR D2 XOR D3
+  
+  P XOR D1 XOR D1' 
+  = (D0 XOR D1 XOR D2 XOR D3) XOR D1 XOR D1'
+  = D0 XOR (D1 XOR D1) XOR D2 XOR D3 XOR D1'    ← D1 XOR D1 = 0
+  = D0 XOR D1' XOR D2 XOR D3
+  = P'   ✓
+```
+
+所以RMW只需要读2样东西：**被修改块的旧值**（old_data）和**旧校验**（old_parity）。
+
+用一个具体例子展示完整流程（5盘RAID5，修改D1）：
+
+```
+【RMW流程：5盘RAID5，只修改D1】
+
+  Disk0    Disk1    Disk2    Disk3    Disk4(P)
+  ┌────┐  ┌────┐  ┌────┐  ┌────┐  ┌────┐
+  │ D0 │  │ D1 │  │ D2 │  │ D3 │  │ P  │
+  └────┘  └────┘  └────┘  └────┘  └────┘
+
+  Step 1: 读取旧值
+  ─────────────────────────────────────────
+          ┌────┐                    ┌────┐
+    READ  │oldD1│              READ │oldP│
+          └──┬─┘                    └──┬─┘
+             │                         │
+  Step 2: XOR差分计算（CPU操作，不涉及磁盘IO）
+  ─────────────────────────────────────────
+     new_P = old_P  XOR  old_D1  XOR  new_D1
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+             只需3个值就能算出新校验
+
+  Step 3: 写入新值
+  ─────────────────────────────────────────
+          ┌────┐                    ┌────┐
+   WRITE  │newD1│             WRITE │newP│
+          └────┘                    └────┘
+
+  总代价：2次读 + 2次写 = 4次磁盘IO
+  不管stripe有多少数据盘，修改1块的代价始终是4次IO
+```
+
+RMW在内核中的实现分为两个阶段：**prexor**（预异或）和**reconstruct**（重建）。prexor阶段先用旧数据"减去"变化前的值，reconstruct阶段再"加上"变化后的值：
 
 ```c
-/* raid5.c: 选择RMW还是RCW */
-/*
- * 如果修改的数据盘数 <= 数据盘总数/2，使用RMW（读更少的块）
- * 否则使用RCW（重建更高效）
- */
+/* raid5.c: ops_run_prexor5 —— RMW的第一步：从旧parity中"减去"旧数据 */
+static struct dma_async_tx_descriptor *
+ops_run_prexor5(struct stripe_head *sh, struct raid5_percpu *percpu,
+        struct dma_async_tx_descriptor *tx)
+{
+    int disks = sh->disks;
+    struct page **xor_srcs = to_addr_page(percpu, 0);
+    int count = 0, pd_idx = sh->pd_idx, i;
+
+    /* P盘（校验盘）既是源也是目标 */
+    struct page *xor_dest = xor_srcs[count++] = sh->dev[pd_idx].page;
+
+    for (i = disks; i--; ) {
+        struct r5dev *dev = &sh->dev[i];
+        /* 只处理即将被写入的块（Wantdrain标志） */
+        if (test_bit(R5_Wantdrain, &dev->flags)) {
+            xor_srcs[count++] = dev->page;  /* 此时page中是旧数据 */
+        }
+    }
+
+    /* 执行异步XOR：P = P XOR old_D1
+     * 即：P' = old_P XOR old_D1（"减去"旧值）
+     * ASYNC_TX_XOR_DROP_DST 表示目标页也参与XOR运算 */
+    tx = async_xor_offs(xor_dest, ..., xor_srcs, ..., count, ...);
+    return tx;
+}
 ```
+
+prexor完成后，stripe_head中的P盘page已经变成了`old_P XOR old_D1`。接下来`ops_run_reconstruct5`会把新数据（new_D1）XOR进去：
+
+```c
+/* raid5.c: ops_run_reconstruct5 —— RMW的第二步：XOR新数据完成parity更新 */
+static void ops_run_reconstruct5(...)
+{
+    int prexor = 0;
+    ...
+    /* 检测是否走prexor路径（即RMW） */
+    if (head_sh->reconstruct_state == reconstruct_state_prexor_drain_run) {
+        prexor = 1;
+        /* P盘是源也是目标（已经被prexor处理过） */
+        xor_dest = xor_srcs[count++] = sh->dev[pd_idx].page;
+        for (i = disks; i--; ) {
+            struct r5dev *dev = &sh->dev[i];
+            if (head_sh->dev[i].written) {
+                /* 此时page中是新数据（已经drain进来） */
+                xor_srcs[count++] = dev->page;
+            }
+        }
+        /* XOR结果：(old_P XOR old_D1) XOR new_D1 = new_P ✓ */
+    } else {
+        /* RCW路径：直接XOR所有数据盘，从零开始计算新P */
+        xor_dest = sh->dev[pd_idx].page;
+        for (i = disks; i--; ) {
+            if (i != pd_idx)
+                xor_srcs[count++] = sh->dev[i].page;
+        }
+        /* XOR结果：D0 XOR new_D1 XOR D2 XOR D3 = new_P */
+    }
+    /* prexor路径用 XOR_DROP_DST（目标参与运算）
+     * 非prexor路径用 XOR_ZERO_DST（目标先清零再XOR） */
+    flags = prexor ? ASYNC_TX_XOR_DROP_DST : ASYNC_TX_XOR_ZERO_DST;
+    ...
+}
+```
+
+内核用`reconstruct_state`枚举来追踪当前stripe_head处于写流程的哪个阶段：
+
+```c
+/* raid5.h */
+enum reconstruct_states {
+    reconstruct_state_idle = 0,
+    reconstruct_state_prexor_drain_run,   /* RMW: prexor + drain新数据 */
+    reconstruct_state_drain_run,          /* RCW: 直接drain新数据 */
+    reconstruct_state_run,                /* expand扩容 */
+    reconstruct_state_prexor_drain_result,
+    reconstruct_state_drain_result,
+    reconstruct_state_result,
+};
+```
+
+RMW路径走的是`prexor_drain_run`→`prexor_drain_result`——先prexor减去旧值，drain新数据，再reconstruct加上新值。
+
+#### 3.3.2 RCW：读其他盘，从头重算奇偶校验
+
+RCW的思路完全不同——不做差分，直接**收齐所有数据盘的最新值，从零开始计算新的奇偶校验**：
+
+```
+【RCW流程：5盘RAID5，修改D1和D2】
+
+  Disk0    Disk1    Disk2    Disk3    Disk4(P)
+  ┌────┐  ┌────┐  ┌────┐  ┌────┐  ┌────┐
+  │ D0 │  │ D1 │  │ D2 │  │ D3 │  │ P  │
+  └────┘  └────┘  └────┘  └────┘  └────┘
+
+  Step 1: 读取未被修改的数据块
+  ─────────────────────────────────────────
+  ┌────┐                    ┌────┐
+  │ D0 │  READ              │ D3 │  READ
+  └──┬─┘                    └──┬─┘
+     │  new_D1和new_D2已在内存中  │
+
+  Step 2: 用所有数据盘重新计算P（CPU操作）
+  ─────────────────────────────────────────
+     new_P = D0  XOR  new_D1  XOR  new_D2  XOR  D3
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+             需要全部4个数据盘的值
+
+  Step 3: 写入新值
+  ─────────────────────────────────────────
+          ┌────┐  ┌────┐              ┌────┐
+   WRITE  │newD1│ │newD2│        WRITE │newP│
+          └────┘  └────┘              └────┘
+
+  总代价：2次读（D0和D3）+ 3次写（D1, D2, P）= 5次磁盘IO
+```
+
+注意RCW**不需要读旧的P盘和旧的D1、D2**——它只关心"最终所有数据盘上的值是什么"，然后直接算出新P。
+
+RCW在内核中对应`schedule_reconstruction`函数的`rcw`分支：
+
+```c
+/* raid5.c: schedule_reconstruction —— 调度写重建操作 */
+schedule_reconstruction(struct stripe_head *sh, struct stripe_head_state *s,
+                        int rcw, int expand)
+{
+    int i, pd_idx = sh->pd_idx, disks = sh->disks;
+
+    if (rcw) {
+        /* === RCW路径 === */
+        /* 释放prexor可能分配的额外页面（不需要prexor了） */
+        r5c_release_extra_page(sh);
+
+        for (i = disks; i--; ) {
+            struct r5dev *dev = &sh->dev[i];
+            if (dev->towrite && !delay_towrite(conf, dev, s)) {
+                set_bit(R5_LOCKED, &dev->flags);
+                set_bit(R5_Wantdrain, &dev->flags); /* 标记：需要drain新数据 */
+                if (!expand)
+                    clear_bit(R5_UPTODATE, &dev->flags);
+                s->locked++;
+            }
+        }
+        /* 状态设为 drain_run：直接drain新数据，然后XOR所有盘算新P */
+        sh->reconstruct_state = reconstruct_state_drain_run;
+        set_bit(STRIPE_OP_BIODRAIN, &s->ops_request);
+        set_bit(STRIPE_OP_RECONSTRUCT, &s->ops_request);
+
+        /* 如果锁住的盘数 + 最大降级数 == 总盘数，说明是FSW */
+        if (s->locked + conf->max_degraded == disks)
+            if (!test_and_set_bit(STRIPE_FULL_WRITE, &sh->state))
+                atomic_inc(&conf->pending_full_writes);
+
+    } else {
+        /* === RMW路径 === */
+        /* 前置条件：P盘（和Q盘）的旧值必须已经在内存中 */
+        BUG_ON(!(test_bit(R5_UPTODATE, &sh->dev[pd_idx].flags) ||
+                 test_bit(R5_Wantcompute, &sh->dev[pd_idx].flags)));
+
+        for (i = disks; i--; ) {
+            struct r5dev *dev = &sh->dev[i];
+            if (i == pd_idx || i == sh->qd_idx)
+                continue;
+            if (dev->towrite &&
+                (test_bit(R5_UPTODATE, &dev->flags) ||
+                 test_bit(R5_Wantcompute, &dev->flags))) {
+                set_bit(R5_Wantdrain, &dev->flags);
+                set_bit(R5_LOCKED, &dev->flags);
+                clear_bit(R5_UPTODATE, &dev->flags);
+                s->locked++;
+            }
+        }
+        /* 状态设为 prexor_drain_run：先prexor减旧值，再drain新数据 */
+        sh->reconstruct_state = reconstruct_state_prexor_drain_run;
+        set_bit(STRIPE_OP_PREXOR, &s->ops_request);     /* 第一步：prexor */
+        set_bit(STRIPE_OP_BIODRAIN, &s->ops_request);   /* 第二步：drain */
+        set_bit(STRIPE_OP_RECONSTRUCT, &s->ops_request); /* 第三步：XOR */
+    }
+    ...
+}
+```
+
+两条路径的区别一目了然：
+- **RCW**：`drain_run` → 直接drain新数据 → `RECONSTRUCT`从零XOR所有盘
+- **RMW**：`prexor_drain_run` → 先`PREXOR`减旧值 → drain新数据 → `RECONSTRUCT`加新值
+
+#### 3.3.3 内核如何选择策略：代价计数器
+
+理解了两种策略的原理，关键问题来了：**内核怎么决定用哪一种？**
+
+答案藏在`handle_stripe_dirtying`函数中。内核不是简单地比较"修改了多少块"，而是精确计算两种策略各自**还需要多少次额外读IO**，然后选代价低的：
+
+```c
+/* raid5.c: handle_stripe_dirtying —— 策略选择的核心逻辑 */
+static int handle_stripe_dirtying(struct r5conf *conf,
+                                  struct stripe_head *sh,
+                                  struct stripe_head_state *s,
+                                  int disks)
+{
+    int rmw = 0, rcw = 0, i;
+    sector_t recovery_cp = conf->mddev->recovery_cp;
+
+    /* 特殊情况1：如果rmw_level配置为禁用RMW，或者阵列正在恢复中
+     * 且当前stripe在恢复点之后（parity可能不一致），强制使用RCW。
+     * 
+     * 为什么？因为RMW依赖旧parity的正确性来做差分计算。
+     * 如果parity本身就是错的（比如异常断电后还没同步完），
+     * 差分算出来的新parity也是错的——错上加错。
+     * RCW不依赖旧parity，从头重算，所以更安全。
+     */
+    if (conf->rmw_level == PARITY_DISABLE_RMW ||
+        (recovery_cp < MaxSector && sh->sector >= recovery_cp &&
+         s->failed == 0)) {
+        rcw = 1; rmw = 2;  /* 人为让rmw更贵，强制走RCW */
+        pr_debug("force RCW rmw_level=%u, recovery_cp=%llu sh->sector=%llu\n",
+                 conf->rmw_level, ...);
+    } else for (i = disks; i--; ) {
+```
+
+注意第一个分支：**恢复期间强制RCW**。这是一个重要的安全策略——RMW的差分计算`new_P = old_P XOR old_D XOR new_D`成立的前提是old_P必须正确。如果阵列正在resync，意味着部分stripe的parity可能不一致，此时只有RCW（从零重算）才能保证正确性。
+
+然后是正常情况下的代价计算：
+
+```c
+    } else for (i = disks; i--; ) {
+        /* === 计算RMW代价 === */
+        struct r5dev *dev = &sh->dev[i];
+        /* RMW需要读：被修改的数据块（如果旧值不在cache中）+ P/Q盘 */
+        if (((dev->towrite && !delay_towrite(conf, dev, s)) ||
+             i == sh->pd_idx || i == sh->qd_idx ||
+             test_bit(R5_InJournal, &dev->flags)) &&
+            !test_bit(R5_LOCKED, &dev->flags) &&
+            !(uptodate_for_rmw(dev) ||
+              test_bit(R5_Wantcompute, &dev->flags))) {
+            if (test_bit(R5_Insync, &dev->flags))
+                rmw++;                /* 盘正常：需要1次读 */
+            else
+                rmw += 2*disks;       /* 盘故障：代价设为极大值 */
+        }
+
+        /* === 计算RCW代价 === */
+        /* RCW需要读：所有未被覆盖写(OVERWRITE)的数据块 */
+        if (!test_bit(R5_OVERWRITE, &dev->flags) &&    /* 没有被整块覆盖 */
+            i != sh->pd_idx && i != sh->qd_idx &&      /* 不是校验盘 */
+            !test_bit(R5_LOCKED, &dev->flags) &&
+            !(test_bit(R5_UPTODATE, &dev->flags) ||     /* 也不在cache中 */
+              test_bit(R5_Wantcompute, &dev->flags))) {
+            if (test_bit(R5_Insync, &dev->flags))
+                rcw++;                /* 盘正常：需要1次读 */
+            else
+                rcw += 2*disks;       /* 盘故障：代价设为极大值 */
+        }
+    }
+```
+
+这段代码的关键在于：**它不是在数"修改了几块"，而是在数"还需要从磁盘读几块"**。已经在stripe cache中的数据（`R5_UPTODATE`标志）不需要读，所以不计入代价。这意味着策略选择是**动态的**——同样修改2块，如果stripe cache中碰巧缓存了其他块的数据，RCW可能变得更便宜。
+
+计算完两个代价后，比较选择：
+
+```c
+    /* 选择代价更低的策略 */
+    if ((rmw < rcw || (rmw == rcw && conf->rmw_level == PARITY_PREFER_RMW))
+        && rmw > 0) {
+        /* RMW更便宜（或代价相同但配置偏好RMW） */
+        for (i = disks; i--; ) {
+            struct r5dev *dev = &sh->dev[i];
+            /* 对需要读旧值的块，设置Wantread标志 */
+            ...
+            if (...需要读旧数据...) {
+                pr_debug("Read_old block %d for r-m-w\n", i);
+                set_bit(R5_LOCKED, &dev->flags);
+                set_bit(R5_Wantread, &dev->flags);  /* 触发读IO */
+                s->locked++;
+            }
+        }
+    }
+
+    if ((rcw < rmw || (rcw == rmw && conf->rmw_level != PARITY_PREFER_RMW))
+        && rcw > 0) {
+        /* RCW更便宜 */
+        rcw = 0;  /* 重新精确计算 */
+        for (i = disks; i--; ) {
+            struct r5dev *dev = &sh->dev[i];
+            if (!test_bit(R5_OVERWRITE, &dev->flags) &&
+                i != sh->pd_idx && i != sh->qd_idx && ...) {
+                rcw++;
+                if (test_bit(R5_Insync, &dev->flags) &&
+                    test_bit(STRIPE_PREREAD_ACTIVE, &sh->state)) {
+                    pr_debug("Read_old block %d for Reconstruct\n", i);
+                    set_bit(R5_LOCKED, &dev->flags);
+                    set_bit(R5_Wantread, &dev->flags);  /* 触发读IO */
+                    s->locked++;
+                }
+            }
+        }
+    }
+
+    /* 所有需要读的数据都到齐后（rmw==0或rcw==0），启动写操作 */
+    if (s->locked == 0 && (rcw == 0 || rmw == 0))
+        schedule_reconstruction(sh, s, rcw == 0, 0);
+        /* 注意：rcw==0 表示RCW不需要额外读了，传给schedule_reconstruction
+         * 的参数rcw=1表示走RCW路径；rcw!=0表示走RMW路径 */
+}
+```
+
+注意`rmw_level`配置项允许管理员手动干预策略偏好：
+
+```c
+/* raid5.h */
+enum {
+    PARITY_DISABLE_RMW = 0,   /* 禁用RMW，强制RCW */
+    PARITY_ENABLE_RMW,        /* 允许RMW（默认） */
+    PARITY_PREFER_RMW,        /* 代价相同时偏好RMW */
+};
+```
+
+通过sysfs可以查看和修改：
+
+```bash
+# 查看当前策略
+cat /sys/block/md0/md/rmw_level
+# 0 = 禁用RMW，1 = 允许RMW（默认），2 = 偏好RMW
+```
+
+#### 3.3.4 代价分析：什么时候RMW更好，什么时候RCW更好？
+
+用一个5盘RAID5（4个数据盘 + 1个P盘）来量化分析——假设stripe cache中没有任何缓存数据（最坏情况）：
+
+```
+修改 k 个数据块（共4个数据盘）时：
+
+  RMW需要读：k个旧数据块 + 1个旧P = (k+1) 次读
+  RCW需要读：(4-k)个未修改的数据块   = (4-k) 次读
+
+  ┌───────────────────────────────────────────────────┐
+  │ 修改块数k │ RMW读次数 │ RCW读次数 │ 更优策略    │
+  ├───────────┼──────────┼──────────┼─────────────┤
+  │     1     │    2     │    3     │ RMW ✓       │
+  │     2     │    3     │    2     │ RCW ✓       │
+  │     3     │    4     │    1     │ RCW ✓       │
+  │     4     │    5     │    0     │ FSW（无需读）│
+  └───────────────────────────────────────────────────┘
+
+  交叉点：当 k+1 == 4-k，即 k = 1.5 时两者代价相同。
+  所以：修改1块用RMW，修改2块及以上用RCW（或FSW）。
+```
+
+推广到N个数据盘的一般情况：
+
+```
+  RMW读次数 = k + 1（k个旧数据 + 旧P）
+  RCW读次数 = N - k（N个数据盘 - k个已在内存中的新数据）
+
+  交叉点：k + 1 = N - k  →  k = (N-1)/2
+
+  即：修改的块数 < (数据盘数-1)/2 时，RMW更优
+      修改的块数 > (数据盘数-1)/2 时，RCW更优
+```
+
+但这只是**无缓存时的理论分析**。实际上内核的计数器还会考虑stripe cache中已有的数据——如果某个数据块恰好还在cache中（`R5_UPTODATE`），它就不需要从磁盘读了，对应的rmw或rcw计数就不会增加。这就是为什么内核不是简单比较"修改了几块"，而是要逐个磁盘遍历统计实际需要读取的IO数——**缓存命中可以改变最优策略**。
+
+举一个cache影响策略的例子：
+
+```
+【5盘RAID5，修改D1，D0恰好在stripe cache中】
+
+  不考虑cache：
+    RMW需要读：旧D1 + 旧P = 2次读
+    RCW需要读：D0 + D2 + D3 = 3次读  →  选RMW
+
+  D0在cache中：
+    RMW需要读：旧D1 + 旧P = 2次读（D0的cache对RMW没用）
+    RCW需要读：D2 + D3 = 2次读（D0已在cache中不用读了）
+    →  两者代价相同！如果rmw_level == PARITY_PREFER_RMW，选RMW；否则选RCW
+```
+
+#### 3.3.5 为什么内核不直接比较"修改块数"？
+
+看到这里可能会有一个疑问：既然理论上交叉点就是`k = (N-1)/2`，为什么内核不直接数修改块数然后比较，而要这么复杂地遍历所有盘计算rmw/rcw？
+
+原因有三：
+
+**第一，stripe cache让"实际代价"和"理论代价"不同。** 理论分析假设所有旧数据都要从磁盘读。但stripe cache可能缓存了某些块，实际需要读的次数更少。
+
+**第二，磁盘故障让某些读操作变得不可能。** 如果一个需要读的盘故障了（`!R5_Insync`），该读操作的代价被设为`2*disks`（一个极大值），相当于"无穷大"。这巧妙地让内核自动避开需要读故障盘的策略：
+
+```c
+if (test_bit(R5_Insync, &dev->flags))
+    rmw++;                /* 正常盘：代价+1 */
+else
+    rmw += 2*disks;       /* 故障盘：代价设为极大值，几乎不可能被选中 */
+```
+
+例如，如果P盘故障了，RMW需要读旧P但读不到（代价暴涨），内核就自动选RCW（不需要读P盘）。
+
+**第三，部分写（非OVERWRITE）需要特殊处理。** 如果一个4KB的写请求只修改了chunk中的一部分（比如chunk是512KB但只写了4KB），`R5_OVERWRITE`标志不会被设置。这意味着RCW也需要把这个块读出来（因为未被覆盖的部分需要参与重算），而不是简单地将它视为"已修改"。
+
+这三个因素叠加在一起，让策略选择变成了一个需要**逐盘遍历**才能精确计算的问题，而不是简单的数学比较。
+
+#### 3.3.6 RMW vs RCW的性能影响
+
+理解了两种策略后，回到性能优化的话题。对于RAID5的写性能，关键结论是：
+
+**1. 小IO随机写是RAID5的噩梦。** 4KB随机写几乎必然走RMW（只修改stripe中1个chunk），每次写都带来额外的2次读——这就是"RAID5写惩罚"（write penalty）的根源。
+
+**2. stripe cache大小影响策略选择。** 更大的stripe cache意味着更多旧数据留在内存中，减少RMW/RCW的实际读次数，甚至可能让多个小写合并成FSW。
+
+**3. rmw_level参数可以调优。** 对于RAID6（有P和Q两个校验盘），RMW需要同时更新P和Q，计算量翻倍。此时可以通过设置`rmw_level=0`强制使用RCW，避免复杂的双校验差分计算：
+
+```bash
+# RAID6场景下禁用RMW，强制RCW
+echo 0 > /sys/block/md0/md/rmw_level
+
+# RAID5场景下偏好RMW（减少读取量）
+echo 2 > /sys/block/md0/md/rmw_level
+```
+
+> **建议5：理解RMW/RCW的代价模型是优化RAID5写性能的基础。**
+>
+> 对于RAID5：保持默认的`rmw_level=1`通常是最优的，让内核动态选择。如果工作负载以大块顺序写为主（容易触发FSW或RCW），可以试试`rmw_level=0`（禁用RMW）简化代码路径。
+>
+> 对于RAID6：建议设置`rmw_level=0`（禁用RMW），因为RAID6的RMW需要同时读写P和Q两个校验盘（4次读+4次写），而RCW只需要读未修改的数据盘再重算P和Q。
+>
+> 无论哪种策略，最有效的优化始终是**让写操作对齐到stripe大小，直接触发FSW**——彻底绕过RMW/RCW。
 
 ### 3.4 Batch Write：合并多个stripe的写操作
 
