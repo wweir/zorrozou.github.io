@@ -20,53 +20,397 @@
 
 ## 一、架构概览：Device Mapper是一切的基础
 
+### 1.1 DM框架：虚拟块设备的"路由器"
+
 Linux的LVM和软RAID（md）虽然面向用户的工具链不同（lvm2 vs mdadm），但在内核IO路径上都依赖同一个框架：**Device Mapper（DM）**。
 
-DM的核心思想是：将一个虚拟块设备的IO请求，通过"映射表（mapping table）"转换后分发给一个或多个底层真实块设备。这个转换过程由各种**target**（目标模块）实现，常见的有：
+DM的核心思想可以用一句话概括：**将一个虚拟块设备的IO请求，通过"映射表（mapping table）"转换后分发给一个或多个底层真实块设备。** 如果把IO路径比作网络数据包的路由，那DM就是一个"路由器"——它根据映射表（相当于路由表）决定每个IO请求应该被转发到哪个底层设备。
 
-| target类型 | 实现文件 | 用途 |
-|---|---|---|
-| `linear` | `dm-linear.c` | 线性映射，LVM基本块 |
-| `striped` | `dm-stripe.c` | 条带化，LVM条带卷 |
-| `raid` | `dm-raid.c` | 软RAID，底层封装md |
-| `thin` | `dm-thin.c` | 精简置备 |
-| `cache` | `dm-cache-target.c` | 块缓存 |
+这个转换过程由各种**target**（目标模块）实现，每种target定义了不同的映射策略。DM框架本身不关心具体的映射逻辑，它只负责：接收bio → 查映射表 → 调用target的map回调 → 将转换后的bio提交给底层设备。
 
-从IO路径的角度看，一个写请求进入虚拟块设备后的流程如下：
+### 1.2 DM的核心数据结构
 
-```
-用户进程 write()
-    ↓
-VFS / 页缓存
-    ↓
-通用块层（submit_bio）
-    ↓
-dm_submit_bio()          ← DM框架入口
-    ↓
-target->map()            ← 例如 stripe_map()
-    ↓
-bio重定向到底层设备
-    ↓
-底层块设备驱动
-```
-
-关键函数是`dm_submit_bio()`，它从`dm.c`接收bio，查找映射表，调用对应target的`.map`回调，完成地址转换后将bio提交给底层设备。整个过程是同步的、无锁的（通过RCU保护映射表），这使得DM框架本身的开销非常小。
+理解DM的工作方式，需要先看几个关键的数据结构：
 
 ```c
-/* dm.c: DM的bio入口 */
-static void dm_submit_bio(struct bio *bio)
+/* dm.c / dm-core.h */
+struct mapped_device {
+    struct dm_table __rcu   *map;           /* 当前活跃的映射表（RCU保护） */
+    struct gendisk          *disk;          /* 对应的虚拟块设备 */
+    struct request_queue    *queue;         /* 请求队列 */
+    ...
+};
+
+struct dm_table {
+    struct dm_target        *targets;       /* target数组 */
+    unsigned int            num_targets;    /* target数量 */
+    ...
+};
+
+struct dm_target {
+    struct dm_table         *table;
+    struct target_type      *type;          /* target类型（linear/striped/raid...） */
+    sector_t                begin;          /* 该target在虚拟设备上的起始扇区 */
+    sector_t                len;            /* 该target管理的扇区数 */
+    void                    *private;       /* target的私有数据 */
+    ...
+};
+```
+
+`mapped_device`是DM的顶层结构，代表一个虚拟块设备（如`/dev/dm-0`）。它持有一个`dm_table`，表中包含一个或多个`dm_target`——每个target负责虚拟设备上的一段地址空间。这种设计允许一个虚拟设备由多种不同类型的target拼接而成。
+
+用一张图来表示它们的关系：
+
+```
+                        mapped_device (/dev/dm-0)
+                              │
+                              ▼
+                          dm_table
+                       ┌──────┴──────┐
+                       ▼             ▼
+                  dm_target[0]   dm_target[1]
+                  type: linear   type: striped
+                  begin: 0       begin: 1000000
+                  len: 1000000   len: 2000000
+                       │              │
+                       ▼              ▼
+                   /dev/sda      /dev/sdb + /dev/sdc
+                  (直接1:1映射)   (数据在两盘间交替分布)
+```
+
+每个`dm_target`还有一个关键字段`type`，指向`target_type`结构体——这就是各种target模块注册的"方法表"：
+
+```c
+/* 每种target模块都要注册一个target_type */
+struct target_type {
+    const char *name;                       /* target名称，如"linear"/"striped" */
+    ...
+    dm_map_fn map;                          /* 核心：IO映射回调 */
+    dm_io_hints_fn io_hints;                /* 向上层报告最优IO参数 */
+    dm_ctr_fn ctr;                          /* 构造函数 */
+    dm_dtr_fn dtr;                          /* 析构函数 */
+    ...
+};
+```
+
+其中`map`是最核心的回调——DM框架对每个bio都会调用它来完成地址转换。不同target的性能差异，本质上就是这个`map`函数的实现复杂度差异。
+
+### 1.3 target类型详解：从简单到复杂
+
+DM框架下有多种target类型，它们的IO路径复杂度和性能特征差异很大。下面从最简单的开始逐一分析：
+
+#### linear——最简单的1:1映射
+
+`linear`是最基本的target，对应LVM的普通逻辑卷。它的map函数只做一件事：**把虚拟设备的扇区地址加上一个偏移量，直接转换成底层设备的扇区地址。**
+
+```c
+/* dm-linear.c */
+static int linear_map(struct dm_target *ti, struct bio *bio)
 {
-    struct mapped_device *md = bio->bi_bdev->bd_disk->private_data;
+    struct linear_c *lc = ti->private;
+    bio_set_dev(bio, lc->dev->bdev);               /* 重定向到底层设备 */
+    bio->bi_iter.bi_sector = linear_map_sector(ti,  /* 扇区地址偏移 */
+                                bio->bi_iter.bi_sector);
+    return DM_MAPIO_REMAPPED;                       /* 告诉DM：bio已映射完成 */
+}
+
+static sector_t linear_map_sector(struct dm_target *ti, sector_t bi_sector)
+{
+    struct linear_c *lc = ti->private;
+    return lc->start + dm_target_offset(ti, bi_sector);  /* 就是一次加法 */
+}
+```
+
+整个map函数只有一次加法运算和一次设备指针赋值，没有任何锁、没有内存分配、没有额外IO。因此linear target的性能开销可以忽略不计，IO延迟几乎等于底层设备的原始延迟。
+
+#### striped——将IO分散到多个设备
+
+`striped`对应LVM条带卷，它把虚拟设备的地址空间按chunk大小切分，轮流映射到多个底层设备上：
+
+```c
+/* dm-stripe.c */
+static int stripe_map(struct dm_target *ti, struct bio *bio)
+{
+    struct stripe_c *sc = ti->private;
+    uint32_t stripe;
+    sector_t result;
+    /* 根据bio的扇区地址，计算应该落在哪个底层设备的哪个位置 */
+    stripe_map_sector(sc, bio->bi_iter.bi_sector, &stripe, &result);
+    bio_set_dev(bio, sc->stripe[stripe].dev->bdev);
+    bio->bi_iter.bi_sector = result + sc->stripe[stripe].physical_start;
+    return DM_MAPIO_REMAPPED;
+}
+```
+
+比linear多了一步：需要通过**取模运算**计算目标设备编号和设备内偏移。但这仍然是纯数学计算，没有额外IO，性能开销极小。详细的计算过程在第二章分析。
+
+#### raid——封装md RAID，复杂度陡增
+
+`raid` target是DM对Linux md RAID子系统的封装。与前两种target有本质区别：**它的map函数不再是简单的地址转换，而是要处理奇偶校验计算、stripe cache管理、RMW/RCW策略选择等复杂逻辑。**
+
+```c
+/* dm-raid.c: raid target的注册 */
+static struct target_type raid_target = {
+    .name    = "raid",
+    .map     = raid_map,
+    .ctr     = raid_ctr,
     ...
-    map = dm_get_live_table_fast(md); /* RCU读锁，极低开销 */
-    ...
-    /* 调用target的map函数完成地址转换 */
-    r = dm_map_bio(tio);
+};
+
+static int raid_map(struct dm_target *ti, struct bio *bio)
+{
+    struct raid_set *rs = ti->private;
+    struct mddev *mddev = &rs->md;
+    /* 不是简单映射，而是将bio交给md子系统处理 */
+    md_handle_request(mddev, bio);
+    return DM_MAPIO_SUBMITTED;  /* 注意：返回SUBMITTED而不是REMAPPED */
+}
+```
+
+注意返回值的差异：linear和striped返回`DM_MAPIO_REMAPPED`，表示"我已经改好了bio的目标地址，DM框架你帮我提交就行"；而raid返回`DM_MAPIO_SUBMITTED`，表示"bio我自己处理了，DM框架不用管了"。这个差异意味着raid的IO路径完全脱离了DM的简单映射流程，进入了md子系统的复杂处理逻辑。
+
+#### thin——精简置备，按需分配
+
+`thin` target实现了精简置备（thin provisioning）——虚拟设备可以声明一个很大的容量，但实际的物理存储空间在写入时才按需分配。
+
+```c
+/* dm-thin.c */
+static int thin_bio_map(struct dm_target *ti, struct bio *bio)
+{
+    struct thin_c *tc = ti->private;
+    struct dm_thin_lookup_result result;
+    /* 查询映射树：这个虚拟块是否已经分配了物理空间？ */
+    r = dm_thin_find_block(tc->td, block, 0, &result);
+    if (r == -ENODATA) {
+        /* 未分配 → 需要从池中分配新的物理块 */
+        /* 这里涉及元数据更新、可能的写时复制等复杂操作 */
+        ...
+    }
     ...
 }
 ```
 
-理解了这个框架，我们就可以分别看LVM条带化和软RAID的具体实现。
+thin的map函数需要查询一棵B+树来判断虚拟块是否已映射到物理块。如果是首次写入，还需要从存储池中分配物理块并更新元数据。这使得thin target的写延迟会有偶发的毛刺（首次分配时），但稳态下的读性能接近linear。
+
+#### cache——分层缓存
+
+`cache` target在慢速设备（如HDD）前面放一个快速设备（如SSD）作为缓存层，类似CPU的L1/L2缓存思想：
+
+```c
+/* dm-cache-target.c */
+static int cache_map(struct dm_target *ti, struct bio *bio)
+{
+    struct cache *cache = ti->private;
+    /* 查询bio对应的块是否在缓存中 */
+    /* 命中 → 从SSD读取/写入 */
+    /* 未命中 → 从HDD读取，同时可能触发缓存填充 */
+    /* 脏数据回写、缓存替换策略等 */
+    ...
+}
+```
+
+cache的map函数涉及缓存查找、命中/未命中处理、数据迁移和替换策略，是所有target中逻辑最复杂的之一。
+
+### 1.4 各target的IO路径对比
+
+把上述所有target的IO路径画在一张图中，可以清楚地看到它们的复杂度差异：
+
+```
+                    用户进程 write()
+                         │
+                         ▼
+                    VFS / 页缓存
+                         │
+                         ▼
+                   通用块层 submit_bio()
+                         │
+                         ▼
+                   dm_submit_bio()
+                ┌────────┼────────────────────────────┐
+                │        │                            │
+          ┌─────┴─────┐  │  ┌──────────────────────┐  │  ┌────────────────┐
+          │  linear    │  │  │   striped            │  │  │  raid          │
+          │            │  │  │                      │  │  │                │
+          │ 地址+偏移  │  │  │ 取模→选盘→算偏移    │  │  │ md_handle_     │
+          │ (1次加法)  │  │  │ (取模+加法)          │  │  │ request()      │
+          │            │  │  │                      │  │  │     │          │
+          │   ○        │  │  │   ○                  │  │  │     ▼          │
+          └───┼────────┘  │  └───┼──────────────────┘  │  │ stripe cache  │
+              │           │      │                     │  │ 查找/分配      │
+              │           │      │                     │  │     │          │
+              │           │      │                     │  │     ▼          │
+              │           │      │                     │  │ RMW/RCW/FSW   │
+              │           │      │                     │  │ 策略选择       │
+              │           │      │                     │  │     │          │
+              │           │      │                     │  │     ▼          │
+              │           │      │                     │  │ 奇偶校验计算  │
+              │           │      │                     │  │ (XOR/P+Q)     │
+              │           │      │                     │  │     │          │
+              │           │      │                     │  │     ▼          │
+              │           │      │                     │  │ 多个bio       │
+              │           │      │                     │  │ (数据+校验)   │
+              └──────┐    │   ┌──┘                     │  └──┬─────────┬──┘
+                     │    │   │                        │     │         │
+                     ▼    │   ▼                        │     ▼         ▼
+                   1个bio │ 1个bio                     │  多个bio(数据+P)
+                     │    │   │                        │     │         │
+                     ▼    ▼   ▼                        ▼     ▼         ▼
+                   ┌───────────────────────────────────────────────────────┐
+                   │              底层块设备驱动（NVMe/virtio/SCSI）       │
+                   └───────────────────────────────────────────────────────┘
+
+  IO路径复杂度：linear < striped <<< raid
+  map函数开销：  ~10ns    ~20ns       ~数百ns到数μs（不含实际磁盘IO）
+```
+
+这张图清楚地展示了关键差异：
+
+- **linear和striped**：map函数只做地址转换，输入1个bio输出1个bio，开销是纯CPU计算（纳秒级）
+- **raid**：map函数触发整个md子系统的处理流程，可能产生额外的读IO（RMW）、计算开销（XOR）、以及多个输出bio（数据+校验），开销是CPU计算+可能的额外磁盘IO
+
+### 1.5 DM框架的处理流程详解
+
+接下来深入看`dm_submit_bio()`的完整处理流程。一个bio从进入DM到离开，经历了以下步骤：
+
+```c
+/* dm.c: DM的bio入口——完整流程 */
+static void dm_submit_bio(struct bio *bio)
+{
+    struct mapped_device *md = bio->bi_bdev->bd_disk->private_data;
+    struct dm_table *map;
+
+    /* Step 1: 获取映射表（RCU读锁，极低开销） */
+    map = dm_get_live_table_fast(md);
+    if (unlikely(!map)) {
+        bio_io_error(bio);
+        goto out;
+    }
+
+    /* Step 2: 根据bio的扇区地址，找到对应的dm_target */
+    dm_split_and_process_bio(md, map, bio);
+    /* 内部会调用：
+     *   ti = dm_table_find_target(map, bio->bi_iter.bi_sector);
+     *   → 二分查找或直接索引，找到管理该扇区的target
+     */
+
+out:
+    dm_put_live_table_fast(md);  /* 释放RCU读锁 */
+}
+```
+
+Step 2中的`dm_split_and_process_bio()`会做一件很重要的事：**如果bio跨越了target边界或超过了target能处理的最大大小，就把bio拆分成多个小bio，分别交给对应的target处理。**
+
+```c
+/* dm.c */
+static void dm_split_and_process_bio(struct mapped_device *md,
+                                      struct dm_table *map, struct bio *bio)
+{
+    struct dm_target *ti;
+    sector_t len;
+
+    ti = dm_table_find_target(map, bio->bi_iter.bi_sector);
+
+    /* 如果bio超过了这个target管理的范围，需要拆分 */
+    len = min(max_io_len(ti, bio), bio->bi_iter.bi_size >> SECTOR_SHIFT);
+    if (len < bio_sectors(bio)) {
+        /* 拆分bio：前半部分交给当前target，后半部分递归处理 */
+        struct bio *split = bio_split(bio, len, GFP_NOIO, &md->queue->bio_split);
+        bio_chain(split, bio);
+        submit_bio_noacct(bio);  /* 后半部分重新进入DM */
+        bio = split;
+    }
+
+    /* 调用target的map回调 */
+    __map_bio(bio);
+}
+```
+
+bio拆分机制保证了每个target只需要处理自己地址范围内的IO，不需要关心边界问题。但拆分本身有开销：分配新的bio结构、建立bio chain、可能增加IO完成时的回调层级。因此，**IO大小对齐target边界可以避免不必要的拆分**。
+
+最后是`__map_bio()`——真正调用target的map函数：
+
+```c
+/* dm.c */
+static void __map_bio(struct bio *bio)
+{
+    struct dm_target_io *tio = clone_to_tio(bio);
+    struct dm_target *ti = tio->ti;
+    int r;
+
+    /* 调用target的map回调 */
+    r = ti->type->map(ti, bio);
+
+    switch (r) {
+    case DM_MAPIO_REMAPPED:
+        /* linear/striped等简单target：bio已改好目标，直接提交 */
+        submit_bio_noacct(bio);
+        break;
+
+    case DM_MAPIO_SUBMITTED:
+        /* raid/thin等复杂target：bio已被target接管，不需要DM提交 */
+        break;
+
+    case DM_MAPIO_REQUEUE:
+        /* target请求重新排队（资源不足等） */
+        ...
+        break;
+
+    case DM_MAPIO_KILL:
+        /* target拒绝该IO */
+        bio_io_error(bio);
+        break;
+    }
+}
+```
+
+三种返回值对应了三种不同的IO路径模式：
+
+| 返回值 | 含义 | 典型target | DM框架后续动作 |
+|-------|------|-----------|-------------|
+| `DM_MAPIO_REMAPPED` | target已完成地址转换 | linear, striped | DM提交bio到底层设备 |
+| `DM_MAPIO_SUBMITTED` | target自己处理bio | raid, thin | DM不再管这个bio |
+| `DM_MAPIO_REQUEUE` | 请求重试 | thin（池满时） | 重新入队 |
+
+### 1.6 DM框架的性能开销分析
+
+DM框架本身的性能开销主要来自以下几个环节：
+
+**1) RCU映射表查找**
+
+`dm_get_live_table_fast()`使用`rcu_read_lock()`保护映射表的访问，这在现代内核中几乎零开销（只是禁止抢占），不需要任何原子操作或内存屏障。映射表在运行时极少变化（只有`lvresize`/`pvmove`等管理操作才会更新），所以RCU的"读多写极少"优势被充分发挥。
+
+**2) target查找**
+
+`dm_table_find_target()`需要根据bio的扇区地址找到对应的target。如果映射表只有一个target（最常见的情况，如单个LV），这就是一次直接索引；如果有多个target，则是一次二分查找。对于典型的单LV场景，这一步的开销可以忽略。
+
+**3) bio克隆**
+
+DM需要为每个bio创建一个`dm_target_io`封装，这涉及slab分配器的分配操作。在高IOPS场景下（百万级），这可能成为可观测的开销。内核通过per-CPU的`bioset`缓存来缓解这个问题。
+
+**4) bio拆分**
+
+如果bio跨越target边界或超过`max_io_len`，需要拆分。拆分的开销类似bio克隆，加上bio chain的建立。合理配置chunk大小和IO对齐可以最小化拆分次数。
+
+综合来看，对于linear和striped这种简单target，DM框架的开销主要是bio克隆的slab分配，大约在**数十纳秒**量级。在云盘（毫秒级延迟）和普通SSD（百微秒级延迟）场景下完全可以忽略。但在使用Intel Optane这类超低延迟设备（微秒级）且IOPS达到百万级的极端场景下，DM框架的开销可能占到总延迟的1%~5%。
+
+### 1.7 各target性能特征总结
+
+| target | map复杂度 | 额外IO | 写放大 | 数据冗余 | 典型延迟开销 | 适用场景 |
+|--------|----------|--------|-------|---------|------------|---------|
+| `linear` | O(1)加法 | 无 | 1x | 无 | ~10ns | LVM基本卷，通用存储 |
+| `striped` | O(1)取模+加法 | 无 | 1x | 无 | ~20ns | 需要高吞吐的临时数据 |
+| `raid`(RAID5) | 复杂 | RMW需读 | 最差4x | 有（单盘容错） | ~数百ns+额外IO | 需要冗余的持久数据 |
+| `thin` | B+树查找 | 首写需分配 | 1x（稳态） | 取决于底层 | ~100ns（命中）| 多租户、快照场景 |
+| `cache` | 缓存查找 | 未命中需读源 | 回写时2x | 取决于底层 | ~50ns（命中）| SSD缓存HDD |
+
+其中"写放大"一列需要特别关注：
+- **linear/striped**：写入N字节，底层设备实际写入N字节，写放大为1x
+- **RAID5 RMW**：写入N字节，需要先读旧数据+旧P，再写新数据+新P，写放大最差可达4x
+- **RAID5 FSW**：写入一整条stripe，只需额外写一个校验块，写放大约为`(N+1)/N`（接近1x）
+
+这也是为什么后续章节要花大量篇幅分析RAID5的FSW触发条件和优化方法——**减少写放大是提升RAID5写性能的核心。**
+
+理解了DM框架和各target的特性，我们就可以深入分析每种target的具体实现了。接下来先看最直观的LVM条带化。
 
 ---
 
