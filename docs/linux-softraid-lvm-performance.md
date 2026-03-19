@@ -1262,11 +1262,11 @@ raid5_store_stripe_cache_size(struct mddev *mddev, const char *page, size_t len)
 
 **实验结论：**
 
-1. **核心发现：在云盘环境下，stripe_cache_size 对性能的影响远小于理论预期。** 即便是RAID5最痛点场景——高并发随机小写（iodepth=128×4jobs），从默认值256增大到16384，IOPS变化仅在±5%范围内波动，没有出现预期中的显著提升。
+1. **核心发现：在SATA机械硬盘环境下，stripe_cache_size 对性能的影响远小于理论预期。** 即便是RAID5最痛点场景——高并发随机小写（iodepth=128×4jobs），从默认值256增大到16384，IOPS变化仅在±5%范围内波动，没有出现预期中的显著提升。
 
-2. **原因分析：** 这与测试环境使用的云盘有关。云盘的IO延迟（~800ms写延迟）远高于本地SSD（<100μs），底层存储系统本身就是瓶颈。在这种高延迟设备上，stripe cache中的请求等待合并的时间窗口很短——IO还没来得及在cache中积累就已经被调度下发了。换句话说，**当后端设备足够慢时，stripe_cache_size 的大小不再是限制FSW概率的主要因素**，真正的瓶颈在设备本身。
+2. **原因分析：** 这与测试环境使用的SATA机械硬盘特性有关。机械硬盘的IO延迟在毫秒级，单盘随机IOPS天花板很低（通常100~200 IOPS），底层设备本身就是瓶颈。在这种场景下，IO到达速率受限于设备处理能力，stripe cache中同时存在的待处理stripe数量远低于cache上限——即使默认值256也足够容纳所有活跃stripe。换句话说，**当后端设备足够慢、并发IO数量本身就不高时，增大stripe_cache_size 不会带来额外收益**，因为cache从来就没满过。
 
-3. **对于本地高速SSD阵列**，情况可能完全不同。本地NVMe SSD的延迟在微秒级，IO到达速率远高于云盘场景，stripe cache更容易成为瓶颈。在这种环境下，增大 stripe_cache_size 可能会带来更显著的提升，这需要进一步验证。
+3. **什么环境下这个参数才重要？** 关键条件是：**后端设备足够快，使得IO并发度能够撑满stripe cache**。典型场景是使用本地NVMe SSD组建RAID5阵列——NVMe SSD的延迟在微秒级（~100μs），单盘随机IOPS可达数十万，多盘RAID5的聚合IOPS极高。在这种环境下，大量IO请求会同时涌入stripe cache，默认的256个条目很容易成为瓶颈（cache满时新IO必须等待，无法被合并为FSW）。此时增大stripe_cache_size才能真正提高写合并概率、减少RMW开销。对于SATA HDD阵列，默认值通常已经足够。
 
 4. **读操作和顺序IO完全不受影响**，符合理论预期——stripe cache只参与写路径的合并优化，对读路径无作用；顺序大IO天然是FSW，不需要cache合并。
 
@@ -2634,7 +2634,7 @@ cat /proc/sys/dev/raid/speed_limit_max
    - **顺序大IO完全不受对齐影响**——无论EXT4还是XFS，1M顺序IO在所有对齐配置下性能一致
 
 4. **RAID5写性能的核心**是尽量触发Full Stripe Write，避免RMW：
-   - 增大stripe_cache_size，提高写合并概率。但实测表明**在云盘等高延迟设备上效果有限**（±5%以内），因为后端设备延迟是主要瓶颈，stripe cache中的请求难以积累合并（详见3.1节实验验证）。对于本地高速SSD阵列效果可能更显著
+   - 增大stripe_cache_size，提高写合并概率。但实测表明**在SATA机械硬盘上效果有限**（±5%以内），因为机械盘IOPS低、并发IO少，cache从未被撑满（详见3.1节实验验证）。**该参数在NVMe SSD阵列等高IOPS场景下更有意义**
    - 应用层以stripe大小对齐写入
    - 利用plug机制批量提交IO
 
