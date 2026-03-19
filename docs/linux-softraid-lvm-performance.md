@@ -1266,7 +1266,46 @@ raid5_store_stripe_cache_size(struct mddev *mddev, const char *page, size_t len)
 
 2. **原因分析：** 这与测试环境使用的SATA机械硬盘特性有关。机械硬盘的IO延迟在毫秒级，单盘随机IOPS天花板很低（通常100~200 IOPS），底层设备本身就是瓶颈。在这种场景下，IO到达速率受限于设备处理能力，stripe cache中同时存在的待处理stripe数量远低于cache上限——即使默认值256也足够容纳所有活跃stripe。换句话说，**当后端设备足够慢、并发IO数量本身就不高时，增大stripe_cache_size 不会带来额外收益**，因为cache从来就没满过。
 
-3. **什么环境下这个参数才重要？** 关键条件是：**后端设备足够快，使得IO并发度能够撑满stripe cache**。典型场景是使用本地NVMe SSD组建RAID5阵列——NVMe SSD的延迟在微秒级（~100μs），单盘随机IOPS可达数十万，多盘RAID5的聚合IOPS极高。在这种环境下，大量IO请求会同时涌入stripe cache，默认的256个条目很容易成为瓶颈（cache满时新IO必须等待，无法被合并为FSW）。此时增大stripe_cache_size才能真正提高写合并概率、减少RMW开销。对于SATA HDD阵列，默认值通常已经足够。
+3. **什么环境下这个参数才重要？** 理论上的关键条件是：**后端设备足够快，使得IO并发度能够撑满stripe cache**。但我们的 ramdisk 追加实验表明，即便后端设备延迟接近零（纳秒级），cache 同样没有成为瓶颈——此时瓶颈转移到了内核 raid5d 单线程和锁竞争上。实际上，只有在后端设备速度恰好快到让 cache 成为瓶颈、但又没有快到触及 raid5d 处理上限的"甜蜜区间"，增大该参数才可能有效。对于绝大多数场景（SATA HDD、SSD、甚至 NVMe），默认值 256 通常已经足够。如果确实怀疑 cache 是瓶颈，建议先观察 `/proc/slabinfo` 中 `raid5-*` 条目的 active 数量是否接近 cache 上限，再决定是否调大。
+
+#### 追加实验：用 ramdisk 消除设备瓶颈后的验证
+
+为了排除"后端设备太慢导致看不到效果"的干扰因素，我们使用内核 brd 模块创建 5 块 4GB 的内存虚拟块设备（ramdisk），组建 RAID5 阵列（chunk=256K），直接对裸块设备 `/dev/md0` 进行测试（不挂载文件系统）。ramdisk 的延迟在纳秒级，单盘随机写 IOPS 可达 ~448K，理论上可以将 stripe cache 推到极限。
+
+**测试环境**：5×4GB ramdisk (brd), RAID5, chunk=256K, libaio 引擎（ramdisk 不支持 O_DIRECT），每组30秒×3轮
+
+**Slab 内存使用**（证实 cache 参数确实生效）：
+
+| cache 值 | active stripe_head | total |
+|:--:|:--:|:--:|
+| 256 | 321 | 559 |
+| 1024 | 1333 | 2054 |
+| 4096 | 4576 | 4576 |
+| 8192 | 8619 | 8619 |
+| 16384 | 16783 | 16783 |
+
+**测试结果汇总（IOPS，3轮平均）：**
+
+| 负载 | cache=256 | cache=1024 | cache=4096 | cache=8192 | cache=16384 | 最大波动 |
+|:---|:--:|:--:|:--:|:--:|:--:|:--:|
+| RandWrite 4K (deep, iodepth=128×4jobs) | 674.8K | 670.1K | 645.3K | 631.2K | 662.9K | 6.9% |
+| RandWrite 4K (shallow, iodepth=1×1job) | 161.4K | 161.4K | 159.1K | 159.7K | 155.7K | 3.7% |
+| SeqWrite 1M | 948 | 940 | 914 | 908 | 931 | 4.5% |
+| RandRead 4K (iodepth=128×4jobs) | 1.17M | 1.16M | 1.16M | 1.16M | 1.15M | 1.7% |
+| SeqRead 1M | 3430 | 3410 | 3391 | 3359 | 3345 | 2.6% |
+| RandRW 4K 70/30 (iodepth=64×4jobs) | 449K R | 450K R | 463K R | 440K R | 436K R | 6.0% |
+
+**ramdisk 实验结论：**
+
+结果出乎意料——**即使在设备延迟接近零的 ramdisk 环境中，stripe_cache_size 仍然没有带来显著的性能提升**。所有负载的最大波动仅 6.9%（高并发随机写），且趋势并非"越大越好"，反而是默认值 cache=256 在多数场景下性能最高。
+
+这揭示了一个更深层的事实：**stripe_cache_size 不是简单的"增大就好"——真正的瓶颈在内核 md/raid5 子系统本身**。具体原因：
+
+- **raid5d 单线程架构**：内核 RAID5 的核心处理逻辑由单个内核线程 `raid5d` 驱动，所有 stripe_head 的状态机转换、校验计算调度、IO 提交都在这个线程中串行完成。无论 cache 多大，处理吞吐量受限于这个单线程的处理速率。
+- **stripe_head 锁竞争**：每个 stripe_head 的处理涉及 `sh->lock` 自旋锁和 `conf->device_lock`，高 IOPS 下锁竞争成为瓶颈。增大 cache 意味着更多 stripe_head 参与竞争，并不能提高吞吐。
+- **cache 增大的副作用**：更多的 stripe_head 意味着 `raid5d` 线程需要遍历更长的 handle_list，每次唤醒的处理开销增加，可能反而略微降低性能（这解释了 cache=8192/16384 下随机写 IOPS 反而略低于 cache=256 的现象）。
+
+这个实验彻底说明了：**stripe_cache_size 的效果取决于 cache 是否真正成为瓶颈**。在 SATA HDD 上 cache 没满过所以无效；在 ramdisk 上虽然 IO 速率极高，但内核处理能力（raid5d 单线程 + 锁竞争）才是真正的天花板，cache 同样不是瓶颈。理论上只有在后端设备恰好快到让 cache 满、但又没快到让 raid5d 成为瓶颈的"甜蜜区间"，增大这个参数才可能有效——而这在实践中是一个非常窄的窗口。
 
 4. **读操作和顺序IO完全不受影响**，符合理论预期——stripe cache只参与写路径的合并优化，对读路径无作用；顺序大IO天然是FSW，不需要cache合并。
 
@@ -2634,7 +2673,7 @@ cat /proc/sys/dev/raid/speed_limit_max
    - **顺序大IO完全不受对齐影响**——无论EXT4还是XFS，1M顺序IO在所有对齐配置下性能一致
 
 4. **RAID5写性能的核心**是尽量触发Full Stripe Write，避免RMW：
-   - 增大stripe_cache_size，提高写合并概率。但实测表明**在SATA机械硬盘上效果有限**（±5%以内），因为机械盘IOPS低、并发IO少，cache从未被撑满（详见3.1节实验验证）。**该参数在NVMe SSD阵列等高IOPS场景下更有意义**
+   - 增大stripe_cache_size，提高写合并概率。但实测表明**无论是SATA机械硬盘还是延迟接近零的ramdisk，该参数都未能带来显著提升**（≤7%波动）。SATA HDD上cache本身没满过；ramdisk上虽然IO速率极高，但瓶颈在raid5d单线程和锁竞争，cache同样不是瓶颈。理论上只有后端设备速度恰好落在"cache饱和但raid5d未饱和"的窄窗口才有效。**对绝大多数场景，默认值256已足够**（详见3.1节SATA实验与ramdisk追加实验）
    - 应用层以stripe大小对齐写入
    - 利用plug机制批量提交IO
 
