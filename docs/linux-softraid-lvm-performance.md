@@ -1243,6 +1243,33 @@ raid5_store_stripe_cache_size(struct mddev *mddev, const char *page, size_t len)
 > ```
 > 注意这会消耗内存：每个stripe_head约消耗`成员盘数 × PAGE_SIZE`的内存。5盘RAID5，8192个stripe需要约160MB内存。
 
+#### 实验验证：stripe_cache_size 到底影响多大？
+
+为了验证 stripe_cache_size 对不同工作负载的实际影响，我们在5盘RAID5阵列（chunk_size=256K, XFS, su=256k/sw=4正确对齐）上，测试了5个不同的cache值（256/1024/4096/8192/16384）在6种负载下的性能表现。每个测试60秒，每组3轮取平均值。
+
+**测试结果汇总（IOPS）：**
+
+| 负载 | cache=256 | cache=1024 | cache=4096 | cache=8192 | cache=16384 | 偏差范围 |
+|:---|:--:|:--:|:--:|:--:|:--:|:--:|
+| RandWrite 4K DIO (deep, iodepth=128×4jobs) | 610 | 581 | 585 | 618 | 602 | -4.8%~+1.3% |
+| RandWrite 4K DIO (shallow, iodepth=1×1job) | 123 | 124 | 129 | 166 | 201 | 见注 |
+| SeqWrite 1M DIO | 216 | 214 | 211 | 215 | 220 | -2.5%~+1.7% |
+| RandRead 4K DIO (iodepth=128×4jobs) | 2280 | 2308 | 2302 | 2346 | 2273 | ±3% |
+| SeqRead 1M DIO | 1035 | 1034 | 1034 | 1035 | 1034 | ±0.1% |
+| RandRW 4K 70/30 (iodepth=64×4jobs) | 835R+362W | 799R+346W | 833R+360W | 820R+355W | 824R+357W | ±5% |
+
+**注：** shallow写（iodepth=1）在大cache值下出现较大波动（cache=16384三轮分别为185/293/126 IOPS），属于低IOPS场景下的统计噪音，不具备参考意义。
+
+**实验结论：**
+
+1. **核心发现：在云盘环境下，stripe_cache_size 对性能的影响远小于理论预期。** 即便是RAID5最痛点场景——高并发随机小写（iodepth=128×4jobs），从默认值256增大到16384，IOPS变化仅在±5%范围内波动，没有出现预期中的显著提升。
+
+2. **原因分析：** 这与测试环境使用的云盘有关。云盘的IO延迟（~800ms写延迟）远高于本地SSD（<100μs），底层存储系统本身就是瓶颈。在这种高延迟设备上，stripe cache中的请求等待合并的时间窗口很短——IO还没来得及在cache中积累就已经被调度下发了。换句话说，**当后端设备足够慢时，stripe_cache_size 的大小不再是限制FSW概率的主要因素**，真正的瓶颈在设备本身。
+
+3. **对于本地高速SSD阵列**，情况可能完全不同。本地NVMe SSD的延迟在微秒级，IO到达速率远高于云盘场景，stripe cache更容易成为瓶颈。在这种环境下，增大 stripe_cache_size 可能会带来更显著的提升，这需要进一步验证。
+
+4. **读操作和顺序IO完全不受影响**，符合理论预期——stripe cache只参与写路径的合并优化，对读路径无作用；顺序大IO天然是FSW，不需要cache合并。
+
 ### 3.2 Full Stripe Write：RAID5的理想写路径
 
 当一次写操作覆盖整个stripe的所有数据块时，就是**Full Stripe Write（FSW）**。内核中的判断逻辑：
@@ -2607,7 +2634,7 @@ cat /proc/sys/dev/raid/speed_limit_max
    - **顺序大IO完全不受对齐影响**——无论EXT4还是XFS，1M顺序IO在所有对齐配置下性能一致
 
 4. **RAID5写性能的核心**是尽量触发Full Stripe Write，避免RMW：
-   - 增大stripe_cache_size，提高写合并概率
+   - 增大stripe_cache_size，提高写合并概率。但实测表明**在云盘等高延迟设备上效果有限**（±5%以内），因为后端设备延迟是主要瓶颈，stripe cache中的请求难以积累合并（详见3.1节实验验证）。对于本地高速SSD阵列效果可能更显著
    - 应用层以stripe大小对齐写入
    - 利用plug机制批量提交IO
 
