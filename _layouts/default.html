@@ -115,6 +115,42 @@
       });
     })();
     </script>
+    <!-- Mermaid.js support -->
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+    <script>
+    (function() {
+      // Initialize mermaid
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: 'default',
+        securityLevel: 'loose',
+        fontFamily: '"Inter", "Noto Serif SC", sans-serif',
+        flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis' },
+        sequence: { useMaxWidth: true, showSequenceNumbers: false }
+      });
+
+      // Convert ```mermaid code blocks to mermaid divs
+      document.querySelectorAll('pre > code.language-mermaid').forEach(function(codeBlock, index) {
+        var pre = codeBlock.parentElement;
+        var div = document.createElement('div');
+        div.className = 'mermaid';
+        div.textContent = codeBlock.textContent;
+        pre.parentElement.replaceChild(div, pre);
+      });
+
+      // Also handle <code class="language-mermaid"> without pre wrapper
+      document.querySelectorAll('code.language-mermaid').forEach(function(codeBlock) {
+        if (codeBlock.parentElement.tagName !== 'PRE') {
+          var div = document.createElement('div');
+          div.className = 'mermaid';
+          div.textContent = codeBlock.textContent;
+          codeBlock.parentElement.replaceChild(div, codeBlock);
+        }
+      });
+
+      mermaid.run();
+    })();
+    </script>
     {% if site.google_analytics %}
     <script>
       (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
