@@ -10,6 +10,10 @@ layout: default
 
 ---
 
+## AI与工程实践
+
+* [让AI管理AI跑几千个工单，调度系统当场失控——三套Prompt和一个被验证的设计原则](docs/ai-coding-subagent-review-2026.md)
+
 ## Linux的Cgroup
 
 * [Cgroup - 从CPU资源隔离说起](docs/books/cgroup_linux_cpu_control_group.md)
