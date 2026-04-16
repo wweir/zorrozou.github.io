@@ -12,7 +12,7 @@ layout: default
 
 ## AI与工程实践
 
-* [让AI管理AI跑几千个工单，调度系统当场失控——三套Prompt和一个被验证的设计原则](docs/ai-coding-subagent-review-2026.md)
+* [Sub-Agent 批处理架构设计：确定性与非确定性的分工边界](docs/ai-coding-subagent-review-2026.md)
 
 ## Linux的Cgroup
 
